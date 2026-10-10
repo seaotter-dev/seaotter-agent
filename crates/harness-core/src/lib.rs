@@ -19,6 +19,7 @@
 //!   for review. The harness has no path to compile or run generated Rust.
 
 mod decision;
+mod diff;
 mod effect;
 mod error;
 mod event;
@@ -34,6 +35,7 @@ mod workflow;
 pub use decision::{
     Answer, DecisionModel, DecisionRequest, DecisionResponse, NoulCriteria, Question,
 };
+pub use diff::{Divergence, diff_runs};
 pub use effect::{Capability, Effect};
 pub use error::HarnessError;
 pub use event::{Event, EventKind, EventLog, Usage, input_hash};
