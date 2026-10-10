@@ -1,10 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::decision::{Answer, DecisionModel, DecisionRequest};
+use crate::decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse};
 use crate::effect::{Capability, Effect};
 use crate::error::HarnessError;
+use crate::event::{Event, EventKind, EventLog, Usage, input_hash};
 use crate::generate::{GenOutput, GenRequest, GenerativeModel};
 use crate::node::{Gate, Node, NodeId};
 use crate::policy::{ConfidenceAction, ConfidencePolicy};
@@ -32,6 +34,10 @@ pub struct Run {
     pub state: State,
     /// Every node visited, in order.
     pub path: Vec<NodeId>,
+    /// Decide, generate, and effect steps that succeeded. Deterministic nodes
+    /// and skipped generates are omitted. A failed run returns `Err` and does
+    /// not carry this log.
+    pub events: EventLog,
     pub status: RunStatus,
 }
 
@@ -122,6 +128,7 @@ impl Machine {
     pub async fn run(&self, wf: &Workflow, mut state: State) -> Result<Run, HarnessError> {
         let mut decisions = Decisions::new();
         let mut path = Vec::new();
+        let mut events = EventLog::default();
         let mut current = wf.start().clone();
         loop {
             if path.len() >= self.max_steps {
@@ -132,7 +139,9 @@ impl Machine {
                 .ok_or_else(|| HarnessError::Workflow(format!("unknown node `{current}`")))?;
             path.push(current.clone());
 
-            let (outcome, low_edge) = self.step(wf, node, &mut state, &decisions).await?;
+            let (outcome, low_edge) = self
+                .step(wf, node, &mut state, &decisions, &mut events)
+                .await?;
             match &outcome {
                 Outcome::Decided(answers) => {
                     let value = serde_json::to_value(answers)
@@ -141,11 +150,7 @@ impl Machine {
                     decisions.insert(current.clone(), answers.clone());
                 }
                 Outcome::Generated(output) => {
-                    let value = match output {
-                        GenOutput::Json(v) => v.clone(),
-                        GenOutput::Text(s) => Value::String(s.clone()),
-                    };
-                    state.insert(current.0.clone(), value);
+                    state.insert(current.0.clone(), stored_gen(output));
                 }
                 Outcome::Effected(value) => {
                     state.insert(current.0.clone(), value.clone());
@@ -163,6 +168,7 @@ impl Machine {
                         return Ok(Run {
                             state,
                             path,
+                            events,
                             status: RunStatus::Halted(action),
                         });
                     }
@@ -175,6 +181,7 @@ impl Machine {
                     return Ok(Run {
                         state,
                         path,
+                        events,
                         status: RunStatus::Completed,
                     });
                 }
@@ -190,6 +197,7 @@ impl Machine {
         node: &Node,
         state: &mut State,
         decisions: &Decisions,
+        events: &mut EventLog,
     ) -> Result<(Outcome, Option<ConfidenceAction>), HarnessError> {
         let outcome = match node {
             Node::Deterministic { step, .. } => {
@@ -197,25 +205,25 @@ impl Machine {
                 Outcome::Done
             }
             Node::Decide {
+                id,
                 reads,
                 questions,
                 policy,
-                ..
             } => {
                 let req = DecisionRequest {
                     state: slice(state, reads),
                     questions: questions.clone(),
                 };
-                let (answers, low_edge) = self.decide(req, policy).await?;
+                let (answers, low_edge) = self.decide(id, req, policy, events).await?;
                 return Ok((Outcome::Decided(answers), low_edge));
             }
             Node::Generate {
+                id,
                 task,
                 reads,
                 output,
                 max_tokens,
                 gate,
-                ..
             } => {
                 if let Some(gate) = gate
                     && !gate_open(gate, wf, decisions)
@@ -231,11 +239,19 @@ impl Machine {
                     output: output.clone(),
                     max_tokens: *max_tokens,
                 };
-                let resp = model.complete(req).await?;
+                let resp = model.complete(req.clone()).await?;
                 validate_output(output, &resp.output)?;
+                events.push(Event {
+                    node: id.clone(),
+                    kind: EventKind::Generate,
+                    input_hash: input_hash(&req)?,
+                    output: stored_gen(&resp.output),
+                    confidence: None,
+                    usage: resp.usage.clone(),
+                });
                 Outcome::Generated(resp.output)
             }
-            Node::Effect { name, reads, .. } => {
+            Node::Effect { id, name, reads } => {
                 let effect = self
                     .effects
                     .get(name)
@@ -245,7 +261,23 @@ impl Machine {
                     return Err(HarnessError::CapabilityDenied(capability));
                 }
                 let input = Value::Object(slice(state, reads).into_iter().collect());
-                Outcome::Effected(effect.run(input).await?)
+                let hashed = input_hash(&input)?;
+                let started = Instant::now();
+                let output = effect.run(input).await?;
+                events.push(Event {
+                    node: id.clone(),
+                    kind: EventKind::Effect,
+                    input_hash: hashed,
+                    output: output.clone(),
+                    confidence: None,
+                    usage: Usage {
+                        latency_ms: elapsed_ms(started),
+                        input_tokens: None,
+                        output_tokens: None,
+                        cost_usd: None,
+                    },
+                });
+                Outcome::Effected(output)
             }
         };
         Ok((outcome, None))
@@ -258,25 +290,31 @@ impl Machine {
     /// request; if that is still low confidence, the edge is `Escalate`.
     async fn decide(
         &self,
+        node: &NodeId,
         req: DecisionRequest,
         policy: &ConfidencePolicy,
+        events: &mut EventLog,
     ) -> Result<(Answers, Option<ConfidenceAction>), HarnessError> {
         let model = self
             .decision
             .as_deref()
             .ok_or_else(|| HarnessError::Workflow("no decision model configured".into()))?;
-        let retry_req = (policy.on_low == ConfidenceAction::RetryStronger).then(|| req.clone());
-        let answers = model.evaluate(req).await?.answers;
+        let retry = policy.on_low == ConfidenceAction::RetryStronger;
+        let resp = model.evaluate(req.clone()).await?;
+        record_decide(node, &req, &resp, events)?;
+        let answers = resp.answers;
         if confidence(&answers) >= policy.min_confidence {
             return Ok((answers, None));
         }
-        match (policy.on_low, retry_req) {
+        match (policy.on_low, retry) {
             (ConfidenceAction::Continue, _) => Ok((answers, None)),
-            (ConfidenceAction::RetryStronger, Some(req)) => {
+            (ConfidenceAction::RetryStronger, true) => {
                 let stronger = self.stronger_decision.as_deref().ok_or_else(|| {
                     HarnessError::Workflow("no stronger decision model configured".into())
                 })?;
-                let answers = stronger.evaluate(req).await?.answers;
+                let resp = stronger.evaluate(req.clone()).await?;
+                record_decide(node, &req, &resp, events)?;
+                let answers = resp.answers;
                 if confidence(&answers) >= policy.min_confidence {
                     Ok((answers, None))
                 } else {
@@ -286,6 +324,36 @@ impl Machine {
             (action, _) => Ok((answers, Some(action))),
         }
     }
+}
+
+fn record_decide(
+    node: &NodeId,
+    req: &DecisionRequest,
+    resp: &DecisionResponse,
+    events: &mut EventLog,
+) -> Result<(), HarnessError> {
+    let output =
+        serde_json::to_value(&resp.answers).map_err(|e| HarnessError::Provider(e.to_string()))?;
+    events.push(Event {
+        node: node.clone(),
+        kind: EventKind::Decide,
+        input_hash: input_hash(req)?,
+        output,
+        confidence: Some(confidence(&resp.answers)),
+        usage: resp.usage.clone(),
+    });
+    Ok(())
+}
+
+fn stored_gen(output: &GenOutput) -> Value {
+    match output {
+        GenOutput::Json(v) => v.clone(),
+        GenOutput::Text(s) => Value::String(s.clone()),
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The lowest confidence across a decision's answers. No answers, or a NaN
