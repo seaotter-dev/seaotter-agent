@@ -7,7 +7,7 @@ use crate::decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse};
 use crate::effect::{Capability, Effect};
 use crate::error::HarnessError;
 use crate::event::{Event, EventKind, EventLog, Usage, input_hash};
-use crate::generate::{GenOutput, GenRequest, GenerativeModel};
+use crate::generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, OutputSpec};
 use crate::node::{Gate, Node, NodeId};
 use crate::policy::{ConfidenceAction, ConfidencePolicy};
 use crate::state::State;
@@ -125,7 +125,27 @@ impl Machine {
     /// or a low-confidence edge has no handler.
     ///
     /// Decide, Generate, and Effect outputs are written to `state[node id]`.
-    pub async fn run(&self, wf: &Workflow, mut state: State) -> Result<Run, HarnessError> {
+    pub async fn run(&self, wf: &Workflow, state: State) -> Result<Run, HarnessError> {
+        self.replay(wf, state, &[]).await
+    }
+
+    /// Re-runs `wf` from `state`, serving a step from `trace` when the next
+    /// event has the same node, kind, and input hash. Anything the trace does
+    /// not cover runs live: a decide or generate calls the configured model,
+    /// and an effect calls `run`.
+    ///
+    /// Deterministic steps always re-run. A covered effect still has to be
+    /// registered and granted; its `run` is not called.
+    pub async fn replay(
+        &self,
+        wf: &Workflow,
+        mut state: State,
+        trace: &[Event],
+    ) -> Result<Run, HarnessError> {
+        let mut trace = Trace {
+            events: trace,
+            next: 0,
+        };
         let mut decisions = Decisions::new();
         let mut path = Vec::new();
         let mut events = EventLog::default();
@@ -140,7 +160,7 @@ impl Machine {
             path.push(current.clone());
 
             let (outcome, low_edge) = self
-                .step(wf, node, &mut state, &decisions, &mut events)
+                .step(wf, node, &mut state, &decisions, &mut events, &mut trace)
                 .await?;
             match &outcome {
                 Outcome::Decided(answers) => {
@@ -198,6 +218,7 @@ impl Machine {
         state: &mut State,
         decisions: &Decisions,
         events: &mut EventLog,
+        trace: &mut Trace<'_>,
     ) -> Result<(Outcome, Option<ConfidenceAction>), HarnessError> {
         let outcome = match node {
             Node::Deterministic { step, .. } => {
@@ -214,7 +235,7 @@ impl Machine {
                     state: slice(state, reads),
                     questions: questions.clone(),
                 };
-                let (answers, low_edge) = self.decide(id, req, policy, events).await?;
+                let (answers, low_edge) = self.decide(id, req, policy, events, trace).await?;
                 return Ok((Outcome::Decided(answers), low_edge));
             }
             Node::Generate {
@@ -230,21 +251,29 @@ impl Machine {
                 {
                     return Ok((Outcome::Skipped, None));
                 }
-                let model = self.generative.as_deref().ok_or_else(|| {
-                    HarnessError::Workflow("no generative model configured".into())
-                })?;
                 let req = GenRequest {
                     task: task.clone(),
                     context: Value::Object(slice(state, reads).into_iter().collect()),
                     output: output.clone(),
                     max_tokens: *max_tokens,
                 };
-                let resp = model.complete(req.clone()).await?;
+                let hash = input_hash(&req)?;
+                let resp = if let Some(event) = trace.take(id, EventKind::Generate, &hash) {
+                    GenResponse {
+                        output: fixture_gen(output, &event.output)?,
+                        usage: event.usage.clone(),
+                    }
+                } else {
+                    let model = self.generative.as_deref().ok_or_else(|| {
+                        HarnessError::Workflow("no generative model configured".into())
+                    })?;
+                    model.complete(req.clone()).await?
+                };
                 validate_output(output, &resp.output)?;
                 events.push(Event {
                     node: id.clone(),
                     kind: EventKind::Generate,
-                    input_hash: input_hash(&req)?,
+                    input_hash: hash,
                     output: stored_gen(&resp.output),
                     confidence: None,
                     usage: resp.usage.clone(),
@@ -262,20 +291,29 @@ impl Machine {
                 }
                 let input = Value::Object(slice(state, reads).into_iter().collect());
                 let hashed = input_hash(&input)?;
-                let started = Instant::now();
-                let output = effect.run(input).await?;
+                let (output, usage) =
+                    if let Some(event) = trace.take(id, EventKind::Effect, &hashed) {
+                        (event.output.clone(), event.usage.clone())
+                    } else {
+                        let started = Instant::now();
+                        let output = effect.run(input).await?;
+                        (
+                            output,
+                            Usage {
+                                latency_ms: elapsed_ms(started),
+                                input_tokens: None,
+                                output_tokens: None,
+                                cost_usd: None,
+                            },
+                        )
+                    };
                 events.push(Event {
                     node: id.clone(),
                     kind: EventKind::Effect,
                     input_hash: hashed,
                     output: output.clone(),
                     confidence: None,
-                    usage: Usage {
-                        latency_ms: elapsed_ms(started),
-                        input_tokens: None,
-                        output_tokens: None,
-                        cost_usd: None,
-                    },
+                    usage,
                 });
                 Outcome::Effected(output)
             }
@@ -294,13 +332,17 @@ impl Machine {
         req: DecisionRequest,
         policy: &ConfidencePolicy,
         events: &mut EventLog,
+        trace: &mut Trace<'_>,
     ) -> Result<(Answers, Option<ConfidenceAction>), HarnessError> {
-        let model = self
-            .decision
-            .as_deref()
-            .ok_or_else(|| HarnessError::Workflow("no decision model configured".into()))?;
         let retry = policy.on_low == ConfidenceAction::RetryStronger;
-        let resp = model.evaluate(req.clone()).await?;
+        let resp = resolve_decide(
+            self.decision.as_deref(),
+            node,
+            &req,
+            trace,
+            "no decision model configured",
+        )
+        .await?;
         record_decide(node, &req, &resp, events)?;
         let answers = resp.answers;
         if confidence(&answers) >= policy.min_confidence {
@@ -309,10 +351,14 @@ impl Machine {
         match (policy.on_low, retry) {
             (ConfidenceAction::Continue, _) => Ok((answers, None)),
             (ConfidenceAction::RetryStronger, true) => {
-                let stronger = self.stronger_decision.as_deref().ok_or_else(|| {
-                    HarnessError::Workflow("no stronger decision model configured".into())
-                })?;
-                let resp = stronger.evaluate(req.clone()).await?;
+                let resp = resolve_decide(
+                    self.stronger_decision.as_deref(),
+                    node,
+                    &req,
+                    trace,
+                    "no stronger decision model configured",
+                )
+                .await?;
                 record_decide(node, &req, &resp, events)?;
                 let answers = resp.answers;
                 if confidence(&answers) >= policy.min_confidence {
@@ -323,6 +369,65 @@ impl Machine {
             }
             (action, _) => Ok((answers, Some(action))),
         }
+    }
+}
+
+struct Trace<'a> {
+    events: &'a [Event],
+    next: usize,
+}
+
+impl Trace<'_> {
+    /// Consumes the next event when it is this step. A mismatch leaves the
+    /// cursor where it is, so a later step can still match that event.
+    fn take(&mut self, node: &NodeId, kind: EventKind, hash: &str) -> Option<&Event> {
+        let event = self.events.get(self.next)?;
+        if &event.node == node && event.kind == kind && event.input_hash == hash {
+            self.next += 1;
+            Some(event)
+        } else {
+            None
+        }
+    }
+}
+
+async fn resolve_decide(
+    model: Option<&dyn DecisionModel>,
+    node: &NodeId,
+    req: &DecisionRequest,
+    trace: &mut Trace<'_>,
+    missing: &str,
+) -> Result<DecisionResponse, HarnessError> {
+    let hash = input_hash(req)?;
+    if let Some(event) = trace.take(node, EventKind::Decide, &hash) {
+        return fixture_decide(event);
+    }
+    let model = model.ok_or_else(|| HarnessError::Workflow(missing.to_owned()))?;
+    model.evaluate(req.clone()).await
+}
+
+fn fixture_decide(event: &Event) -> Result<DecisionResponse, HarnessError> {
+    let answers = serde_json::from_value(event.output.clone()).map_err(|e| {
+        HarnessError::Workflow(format!(
+            "replay fixture for `{}` is not a decision: {e}",
+            event.node
+        ))
+    })?;
+    Ok(DecisionResponse {
+        answers,
+        usage: event.usage.clone(),
+    })
+}
+
+fn fixture_gen(spec: &OutputSpec, value: &Value) -> Result<GenOutput, HarnessError> {
+    match spec {
+        OutputSpec::FreeText => match value.as_str() {
+            Some(text) => Ok(GenOutput::Text(text.to_owned())),
+            None => Err(HarnessError::Workflow(
+                "replay fixture for a free-text generate is not a string".into(),
+            )),
+        },
+        OutputSpec::Schema(_) => Ok(GenOutput::Json(value.clone())),
     }
 }
 
