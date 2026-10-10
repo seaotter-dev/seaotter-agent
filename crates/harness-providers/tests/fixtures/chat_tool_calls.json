@@ -1,0 +1,31 @@
+{
+  "id": "chatcmpl-fixture-tools",
+  "object": "chat.completion",
+  "created": 1791648000,
+  "model": "grok-4",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_1",
+            "type": "function",
+            "function": {
+              "name": "issue_refund",
+              "arguments": "{\"order\":\"A-1001\"}"
+            }
+          }
+        ]
+      },
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 112,
+    "completion_tokens": 18,
+    "total_tokens": 130
+  }
+}

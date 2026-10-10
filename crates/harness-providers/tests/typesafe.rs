@@ -1,12 +1,12 @@
+mod common;
+
 use std::collections::BTreeMap;
 
+use common::serve_once;
 use harness_core::{DecisionModel, DecisionRequest, HarnessError, NoulCriteria, Question, State};
 use harness_providers::typesafe::{WireResponse, from_wire, to_wire};
 use harness_providers::{TypeSafeConfig, TypeSafeDecision};
-use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tokio::task::JoinHandle;
+use serde_json::json;
 
 const FIXTURE: &str = include_str!("fixtures/systemone_response.json");
 
@@ -192,56 +192,6 @@ fn out_of_range_noul_is_a_provider_error() {
     assert_provider(from_wire(wire, &questions(), 0));
 }
 
-struct Captured {
-    head: String,
-    body: Value,
-}
-
-/// Serves one HTTP response on a local port and returns what it received.
-async fn serve_once(status: &'static str, body: &'static str) -> (String, JoinHandle<Captured>) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base_url = format!("http://{}", listener.local_addr().unwrap());
-    let handle = tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = Vec::new();
-        let mut chunk = [0u8; 4096];
-        let header_end = loop {
-            let n = socket.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "connection closed before headers");
-            buf.extend_from_slice(&chunk[..n]);
-            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                break i + 4;
-            }
-        };
-        let head = String::from_utf8(buf[..header_end].to_vec()).unwrap();
-        let len: usize = head
-            .lines()
-            .find_map(|l| {
-                let (name, value) = l.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse().unwrap())
-            })
-            .unwrap_or(0);
-        while buf.len() < header_end + len {
-            let n = socket.read(&mut chunk).await.unwrap();
-            assert!(n > 0, "connection closed before body");
-            buf.extend_from_slice(&chunk[..n]);
-        }
-        let received = serde_json::from_slice(&buf[header_end..header_end + len]).unwrap();
-        let response = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-            body.len(),
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
-        socket.shutdown().await.unwrap();
-        Captured {
-            head,
-            body: received,
-        }
-    });
-    (base_url, handle)
-}
-
 fn client(base_url: String) -> TypeSafeDecision {
     let mut config = TypeSafeConfig::new("test-key");
     config.base_url = base_url;
@@ -254,13 +204,9 @@ async fn evaluate_posts_only_state_and_questions() {
     let resp = client(base_url).evaluate(request()).await.unwrap();
     let captured = server.await.unwrap();
 
-    let request_line = captured.head.lines().next().unwrap();
-    assert_eq!(request_line, "POST /v1/systemone HTTP/1.1");
+    assert_eq!(captured.request_line(), "POST /v1/systemone HTTP/1.1");
     assert!(
-        captured
-            .head
-            .lines()
-            .any(|l| l.eq_ignore_ascii_case("authorization: Bearer test-key")),
+        captured.has_header("authorization: Bearer test-key"),
         "{}",
         captured.head
     );

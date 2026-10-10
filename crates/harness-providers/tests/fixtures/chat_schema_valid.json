@@ -1,0 +1,22 @@
+{
+  "id": "chatcmpl-fixture-valid",
+  "object": "chat.completion",
+  "created": 1791648000,
+  "model": "grok-4",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\"summary\":\"Customer wants to return a damaged blender.\",\"priority\":\"high\"}",
+        "refusal": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 112,
+    "completion_tokens": 21,
+    "total_tokens": 133
+  }
+}

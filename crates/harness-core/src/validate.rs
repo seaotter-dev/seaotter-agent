@@ -3,8 +3,9 @@ use crate::generate::{GenOutput, JsonSchema, OutputSpec};
 
 /// Checks a generative output against its spec before it reaches state or a
 /// transition. A bad schema is a workflow error; a bad output is
-/// `SchemaInvalid`.
-pub(crate) fn validate_output(spec: &OutputSpec, output: &GenOutput) -> Result<(), HarnessError> {
+/// `SchemaInvalid`. Providers call it before returning; the `Machine` checks
+/// again.
+pub fn validate_output(spec: &OutputSpec, output: &GenOutput) -> Result<(), HarnessError> {
     match (spec, output) {
         (OutputSpec::Schema(JsonSchema(schema)), GenOutput::Json(value)) => {
             let validator = jsonschema::validator_for(schema)
