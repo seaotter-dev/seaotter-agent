@@ -16,14 +16,26 @@ pub enum Question {
         instructions: String,
         criteria: BTreeMap<String, String>,
     },
-    /// Score against the labels in `criteria` (label to description).
+    /// Score along ordered levels; level `i` is `criteria[i]`, low to high.
     Score {
         instructions: String,
-        criteria: BTreeMap<String, String>,
+        criteria: Vec<String>,
     },
+    /// Yes or no, optionally with what each answer means.
     Noul {
         instructions: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        criteria: Option<NoulCriteria>,
     },
+}
+
+/// What a yes and a no mean for a `Noul` question.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NoulCriteria {
+    #[serde(rename = "true")]
+    pub yes: String,
+    #[serde(rename = "false")]
+    pub no: String,
 }
 
 /// The state slice a `Decide` node is allowed to see, plus its questions.

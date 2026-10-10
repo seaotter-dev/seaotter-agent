@@ -75,6 +75,7 @@ fn workflow(on_low: ConfidenceAction) -> Workflow {
                 "q".into(),
                 Question::Noul {
                     instructions: "Is this safe to answer?".into(),
+                    criteria: None,
                 },
             )]),
             policy: ConfidencePolicy {
