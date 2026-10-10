@@ -121,6 +121,28 @@ pub fn summarize(runs: &[RunRecord]) -> Result<Summary, HarnessError> {
     })
 }
 
+/// Cell text the evaluation table must contain for this summary.
+pub fn table_cells(summary: &Summary) -> Vec<String> {
+    let modal = summary
+        .branch_counts
+        .get(&summary.modal_branch)
+        .copied()
+        .unwrap_or(0);
+    vec![
+        summary.modal_branch.clone(),
+        format!("{modal}/{}", summary.runs),
+        format!("{:.1}", summary.mean_latency_ms),
+        match summary.mean_input_tokens {
+            Some(tokens) => format!("{tokens:.1}"),
+            None => "omitted".into(),
+        },
+        match summary.mean_output_tokens {
+            Some(tokens) => format!("{tokens:.1}"),
+            None => "omitted".into(),
+        },
+    ]
+}
+
 /// Phrases the paper evaluation must contain for this summary.
 pub fn quoted_figures(label: &str, summary: &Summary) -> Vec<String> {
     let modal = summary
@@ -671,11 +693,8 @@ mod tests {
     fn paper_quotes_the_committed_measurements() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
         let tex = std::fs::read_to_string(root.join("paper/main.tex")).unwrap();
-        let cases = [
-            ("ticket-router.json", "ticket harness", "ticket ReAct"),
-            ("gated-generate.json", "gated harness", "gated ReAct"),
-        ];
-        for (name, harness_label, react_label) in cases {
+        let cases = ["ticket-router.json", "gated-generate.json"];
+        for name in cases {
             let path = root.join("paper/measurements").join(name);
             let parsed: MeasurementFile = serde_json::from_str(
                 &std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("{path:?}: {err}")),
@@ -687,19 +706,10 @@ mod tests {
             assert_eq!(harness.branch_counts, parsed.harness.summary.branch_counts);
             assert_eq!(react.modal_branch, parsed.react.summary.modal_branch);
             assert_eq!(react.branch_counts, parsed.react.summary.branch_counts);
-            assert_eq!(
-                quoted_figures(harness_label, &harness),
-                quoted_figures(harness_label, &parsed.harness.summary)
-            );
-            assert_eq!(
-                quoted_figures(react_label, &react),
-                quoted_figures(react_label, &parsed.react.summary)
-            );
-            for figure in quoted_figures(harness_label, &harness)
-                .into_iter()
-                .chain(quoted_figures(react_label, &react))
-            {
-                assert!(tex.contains(&figure), "paper missing {figure}");
+            assert_eq!(table_cells(&harness), table_cells(&parsed.harness.summary));
+            assert_eq!(table_cells(&react), table_cells(&parsed.react.summary));
+            for cell in table_cells(&harness).into_iter().chain(table_cells(&react)) {
+                assert!(tex.contains(&cell), "paper missing {cell}");
             }
         }
     }

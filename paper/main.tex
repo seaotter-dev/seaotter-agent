@@ -2,6 +2,13 @@
 
 \usepackage{hyperref}
 \usepackage{graphicx}
+\usepackage{microtype}
+\usepackage{xurl}
+\usepackage{booktabs}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{tikz}
+\usetikzlibrary{automata,positioning,arrows.meta}
 
 \title{Code-Owned Harnesses: Using System One Models for Bounded Agent Workflows}
 \author{Ryan Martin}
@@ -69,10 +76,15 @@ the following step.
 \section{Design}
 \label{sec:design}
 
-The next node is a transition: a function of the node that just ran, its
-outcome, and the workflow state. The machine stores the model output under the
-node identifier and then calls that function. The output is a value. It is
-not a pointer to the next node.
+The next node is a transition. The machine stores the model output under the
+node identifier and then applies
+\begin{equation}
+\delta : \mathit{Node} \times \mathit{Outcome} \times \mathit{State} \rightarrow \mathit{Next}.
+\label{eq:delta}
+\end{equation}
+The output is a value. It is not a pointer to the next node.
+Figure~\ref{fig:procedures} contrasts that step with a ReAct loop on the same
+task.
 
 A decision call sends only the state keys the node lists, plus a fixed set of
 questions. A \texttt{Choice} question picks one label from a closed map. A
@@ -93,13 +105,48 @@ allowed value and the confidence policy continued. A body that fails the
 schema is rejected before the transition runs, so invalid text cannot choose
 a node.
 
+\begin{figure}[t]
+\centering
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\begin{algorithmic}[1]
+\Procedure{ReAct}{$o$}
+\For{$t \gets 1$ \textbf{to} $4$}
+  \State $(thought, a) \gets complete(o)$
+  \If{$a = \mathrm{finish}$}
+    \State \Return branch
+  \EndIf
+\EndFor
+\State \Return $\mathrm{unfinished}$
+\EndProcedure
+\end{algorithmic}
+\end{minipage}\hfill
+\begin{minipage}[t]{0.48\textwidth}
+\centering
+\begin{algorithmic}[1]
+\Procedure{Harness}{$n, s$}
+\State $x \gets \mathrm{slice}(s, \mathrm{reads}(n))$
+\If{$n$ is Decide}
+  \State $y \gets \mathrm{SystemOne}(x)$
+\ElsIf{$n$ is Generate and the gate allows}
+  \State $y \gets \mathrm{complete}(x)$
+\EndIf
+\State \Return $\delta(n, y, s)$
+\EndProcedure
+\end{algorithmic}
+\end{minipage}
+\caption{Control procedures. \textsc{ReAct} stops on $\mathrm{finish}$ or at
+step four. \textsc{Harness} applies $\delta$ after one bounded model call.}
+\label{fig:procedures}
+\end{figure}
+
 \section{Implementation}
 \label{sec:implementation}
 
-The library is three crates. \texttt{harness-core} holds the machine, the
+The library is three crates. \path{harness-core} holds the machine, the
 node graph, the decision and generative traits, and the event log.
-\texttt{harness-providers} supplies a System One decision client and
-OpenAI-compatible and Anthropic generative clients. \texttt{harness-effects}
+\path{harness-providers} supplies a System One decision client and
+OpenAI-compatible and Anthropic generative clients. \path{harness-effects}
 supplies the effects. Swapping the generative client does not change the
 graph.
 
@@ -124,50 +171,84 @@ safe-default queue. There is no generative call.
 \texttt{gated-generate} asks a yes-or-no question. At sufficient confidence
 the run reaches a draft node whose schema requires a string reply. A no
 answer skips the model. Low confidence never visits the draft node.
+Figure~\ref{fig:automata} is the state machine for each example.
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}[
+  >=Stealth,
+  shorten >=1pt,
+  node distance=7mm and 14mm,
+  every state/.style={font=\footnotesize, inner sep=1.5pt, minimum size=0pt},
+  every edge/.style={font=\scriptsize},
+  initial text={}
+]
+  \node[state, initial] (n) {normalize};
+  \node[state, right=of n] (c) {classify};
+  \node[state, above right=1mm and 16mm of c] (b) {billing};
+  \node[state, right=18mm of c] (t) {technical};
+  \node[state, below right=1mm and 16mm of c] (a) {account};
+  \node[state, below=of a] (q) {queue};
+  \path[->] (n) edge (c)
+            (c) edge node[above] {billing} (b)
+            (c) edge node[above] {technical} (t)
+            (c) edge node[below] {account} (a)
+            (c) edge node[right] {queue} (q);
+  \begin{scope}[yshift=-32mm]
+    \node[state, initial] (gn) {normalize};
+    \node[state, right=of gn] (gg) {gate};
+    \node[state, above right=1mm and 14mm of gg] (gd) {draft};
+    \node[state, right=of gd] (gdd) {drafted};
+    \node[state, below right=1mm and 14mm of gg] (gs) {safe};
+    \path[->] (gn) edge (gg)
+              (gg) edge node[above] {true} (gd)
+              (gd) edge (gdd)
+              (gg) edge node[below] {false} (gs)
+              (gg) edge[bend right=15] node[below] {low} (gs);
+  \end{scope}
+\end{tikzpicture}
+\caption{Measured automata. Low confidence in the ticket router takes
+\texttt{queue}. A false or low-confidence gate takes \texttt{safe} and does
+not call the generative model.}
+\label{fig:automata}
+\end{figure}
 
 \section{Evaluation}
 \label{sec:evaluation}
 
 The baseline is a ReAct-style loop on the same OpenAI-compatible model the
-harness uses for its generative draft, \texttt{gpt-4.1-mini-2025-04-14}.
+harness uses for its generative draft, \path{gpt-4.1-mini-2025-04-14}.
 Harness decisions use the System One model \texttt{jev-latest}.
 Each ReAct step returns a thought and an action that matches a JSON schema.
 The action \texttt{inspect} returns the fixture text.
 The action \texttt{finish} ends the loop.
 A loop that reaches four steps without finishing is branch \texttt{unfinished}.
 Raw runs, the fixture paths, and the rerun command are in
-\texttt{paper/measurements/}.
+\path{paper/measurements/}.
+Ten runs of \path{examples/ticket-router/fixtures/billing.json} route one
+support ticket.
+Ten runs of \path{examples/gated-generate/fixtures/allow.json} decide whether
+a reply may be drafted.
+Table~\ref{tab:eval} reports the mean latency, token counts, and branch
+stability.
 
-Ten sequential runs of \texttt{examples/ticket-router/fixtures/billing.json}
-route one support ticket.
-The harness is one System One choice.
-It records ticket harness modal branch billing,
-ticket harness stability 10/10,
-ticket harness mean latency 189.6 ms,
-ticket harness mean input tokens 422.0,
-and ticket harness mean output tokens 38.0.
-The ReAct baseline records ticket ReAct modal branch billing,
-ticket ReAct stability 10/10,
-ticket ReAct mean latency 1823.4 ms,
-ticket ReAct mean input tokens 445.2,
-and ticket ReAct mean output tokens 66.4.
-
-Ten sequential runs of \texttt{examples/gated-generate/fixtures/allow.json}
-decide whether a reply may be drafted.
-The harness asks a System One yes-or-no question and drafts only when that
-gate allows.
-On these runs the destination was \texttt{safe} after the decision step.
-It records gated harness modal branch safe,
-gated harness stability 10/10,
-gated harness mean latency 200.1 ms,
-gated harness mean input tokens 296.0,
-and gated harness mean output tokens 20.0.
-The ReAct baseline decides and drafts inside the same generative loop.
-It records gated ReAct modal branch drafted,
-gated ReAct stability 10/10,
-gated ReAct mean latency 2532.0 ms,
-gated ReAct mean input tokens 850.4,
-and gated ReAct mean output tokens 198.4.
+\begin{table}[t]
+\centering
+\caption{Mean latency in milliseconds, input and output tokens, and branch
+stability over ten runs.}
+\label{tab:eval}
+{\footnotesize
+\begin{tabular}{@{}llrrrrr@{}}
+\toprule
+Workflow & Side & Branch & Stability & ms & Input & Output \\
+\midrule
+ticket router & harness & billing & 10/10 & 189.6 & 422.0 & 38.0 \\
+ticket router & ReAct & billing & 10/10 & 1823.4 & 445.2 & 66.4 \\
+gated generation & harness & safe & 10/10 & 200.1 & 296.0 & 20.0 \\
+gated generation & ReAct & drafted & 10/10 & 2532.0 & 850.4 & 198.4 \\
+\bottomrule
+\end{tabular}}
+\end{table}
 
 \section{Limitations and future work}
 \label{sec:limits}
