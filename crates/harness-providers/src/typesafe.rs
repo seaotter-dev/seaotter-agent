@@ -14,7 +14,7 @@ use harness_core::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::http::post_json;
+use crate::http::send_json;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 pub const DEFAULT_MODEL: &str = "jev-latest";
@@ -97,14 +97,12 @@ impl DecisionModel for TypeSafeDecision {
     ) -> BoxFuture<'_, Result<DecisionResponse, HarnessError>> {
         Box::pin(async move {
             let body = to_wire(&req, &self.config.model);
-            let (text, latency_ms) = post_json(
-                &self.client,
-                "typesafe",
-                &self.url(),
-                &self.config.api_key,
-                &body,
-            )
-            .await?;
+            let http = self
+                .client
+                .post(self.url())
+                .bearer_auth(&self.config.api_key)
+                .json(&body);
+            let (text, latency_ms) = send_json("typesafe", http).await?;
             let wire: WireResponse = serde_json::from_str(&text)
                 .map_err(|e| HarnessError::Provider(format!("typesafe response json: {e}")))?;
             from_wire(wire, &req.questions, latency_ms)
