@@ -7,25 +7,38 @@ use crate::effect::{Capability, Effect};
 use crate::error::HarnessError;
 use crate::generate::{GenOutput, GenRequest, GenerativeModel};
 use crate::node::{Gate, Node, NodeId};
+use crate::policy::{ConfidenceAction, ConfidencePolicy};
 use crate::state::State;
 use crate::validate::validate_output;
 use crate::workflow::{Next, Outcome, Workflow};
 
 const DEFAULT_MAX_STEPS: usize = 1000;
 
-type Decisions = BTreeMap<NodeId, BTreeMap<String, Answer>>;
+type Answers = BTreeMap<String, Answer>;
+type Decisions = BTreeMap<NodeId, Answers>;
 
-/// The result of a completed run.
+/// How a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    /// The transition returned `Next::End`.
+    Completed,
+    /// A low-confidence decision took an edge with no registered handler.
+    Halted(ConfidenceAction),
+}
+
+/// The result of a finished run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Run {
     pub state: State,
     /// Every node visited, in order.
     pub path: Vec<NodeId>,
+    pub status: RunStatus,
 }
 
 /// Configures a [`Machine`]. No capability is granted unless `grant` is called.
 pub struct MachineBuilder {
     decision: Option<Box<dyn DecisionModel>>,
+    stronger_decision: Option<Box<dyn DecisionModel>>,
     generative: Option<Box<dyn GenerativeModel>>,
     effects: BTreeMap<String, Box<dyn Effect>>,
     granted: BTreeSet<Capability>,
@@ -35,6 +48,12 @@ pub struct MachineBuilder {
 impl MachineBuilder {
     pub fn decision(mut self, model: impl DecisionModel + 'static) -> Self {
         self.decision = Some(Box::new(model));
+        self
+    }
+
+    /// The model used for the second call of a `RetryStronger` policy.
+    pub fn stronger_decision(mut self, model: impl DecisionModel + 'static) -> Self {
+        self.stronger_decision = Some(Box::new(model));
         self
     }
 
@@ -63,6 +82,7 @@ impl MachineBuilder {
     pub fn build(self) -> Machine {
         Machine {
             decision: self.decision,
+            stronger_decision: self.stronger_decision,
             generative: self.generative,
             effects: self.effects,
             granted: self.granted,
@@ -71,10 +91,12 @@ impl MachineBuilder {
     }
 }
 
-/// Runs a [`Workflow`]. The next node always comes from the workflow's
-/// transition function; model output is stored as data, never followed.
+/// Runs a [`Workflow`]. The next node comes from the workflow's transition
+/// function, or from its confidence handlers when a decision is low
+/// confidence; model output is stored as data, never followed.
 pub struct Machine {
     decision: Option<Box<dyn DecisionModel>>,
+    stronger_decision: Option<Box<dyn DecisionModel>>,
     generative: Option<Box<dyn GenerativeModel>>,
     effects: BTreeMap<String, Box<dyn Effect>>,
     granted: BTreeSet<Capability>,
@@ -85,6 +107,7 @@ impl Machine {
     pub fn builder() -> MachineBuilder {
         MachineBuilder {
             decision: None,
+            stronger_decision: None,
             generative: None,
             effects: BTreeMap::new(),
             granted: BTreeSet::new(),
@@ -92,7 +115,8 @@ impl Machine {
         }
     }
 
-    /// Runs `wf` from its start node until the transition returns `Next::End`.
+    /// Runs `wf` from its start node until the transition returns `Next::End`
+    /// or a low-confidence edge has no handler.
     ///
     /// Decide, Generate, and Effect outputs are written to `state[node id]`.
     pub async fn run(&self, wf: &Workflow, mut state: State) -> Result<Run, HarnessError> {
@@ -108,7 +132,7 @@ impl Machine {
                 .ok_or_else(|| HarnessError::Workflow(format!("unknown node `{current}`")))?;
             path.push(current.clone());
 
-            let outcome = self.step(wf, node, &mut state, &decisions).await?;
+            let (outcome, low_edge) = self.step(wf, node, &mut state, &decisions).await?;
             match &outcome {
                 Outcome::Decided(answers) => {
                     let value = serde_json::to_value(answers)
@@ -129,37 +153,61 @@ impl Machine {
                 Outcome::Done | Outcome::Skipped => {}
             }
 
+            if let Some(action) = low_edge {
+                match wf.handler(action) {
+                    Some(handler) => {
+                        current = handler.clone();
+                        continue;
+                    }
+                    None => {
+                        return Ok(Run {
+                            state,
+                            path,
+                            status: RunStatus::Halted(action),
+                        });
+                    }
+                }
+            }
+
             match (wf.transition())(&current, &outcome, &state) {
                 Next::Goto(next) => current = next,
-                Next::End => return Ok(Run { state, path }),
+                Next::End => {
+                    return Ok(Run {
+                        state,
+                        path,
+                        status: RunStatus::Completed,
+                    });
+                }
             }
         }
     }
 
+    /// Runs one node. The second value is the low-confidence edge a `Decide`
+    /// node must take instead of the transition, if any.
     async fn step(
         &self,
         wf: &Workflow,
         node: &Node,
         state: &mut State,
         decisions: &Decisions,
-    ) -> Result<Outcome, HarnessError> {
-        match node {
+    ) -> Result<(Outcome, Option<ConfidenceAction>), HarnessError> {
+        let outcome = match node {
             Node::Deterministic { step, .. } => {
                 step(state)?;
-                Ok(Outcome::Done)
+                Outcome::Done
             }
             Node::Decide {
-                reads, questions, ..
+                reads,
+                questions,
+                policy,
+                ..
             } => {
-                let model = self
-                    .decision
-                    .as_deref()
-                    .ok_or_else(|| HarnessError::Workflow("no decision model configured".into()))?;
                 let req = DecisionRequest {
                     state: slice(state, reads),
                     questions: questions.clone(),
                 };
-                Ok(Outcome::Decided(model.evaluate(req).await?.answers))
+                let (answers, low_edge) = self.decide(req, policy).await?;
+                return Ok((Outcome::Decided(answers), low_edge));
             }
             Node::Generate {
                 task,
@@ -172,7 +220,7 @@ impl Machine {
                 if let Some(gate) = gate
                     && !gate_open(gate, wf, decisions)
                 {
-                    return Ok(Outcome::Skipped);
+                    return Ok((Outcome::Skipped, None));
                 }
                 let model = self.generative.as_deref().ok_or_else(|| {
                     HarnessError::Workflow("no generative model configured".into())
@@ -185,7 +233,7 @@ impl Machine {
                 };
                 let resp = model.complete(req).await?;
                 validate_output(output, &resp.output)?;
-                Ok(Outcome::Generated(resp.output))
+                Outcome::Generated(resp.output)
             }
             Node::Effect { name, reads, .. } => {
                 let effect = self
@@ -197,10 +245,63 @@ impl Machine {
                     return Err(HarnessError::CapabilityDenied(capability));
                 }
                 let input = Value::Object(slice(state, reads).into_iter().collect());
-                Ok(Outcome::Effected(effect.run(input).await?))
+                Outcome::Effected(effect.run(input).await?)
             }
+        };
+        Ok((outcome, None))
+    }
+
+    /// Calls the decision model and applies `policy`. Returns the final
+    /// answers and the low-confidence edge to take, if any.
+    ///
+    /// `RetryStronger` makes one more call to the stronger model with the same
+    /// request; if that is still low confidence, the edge is `Escalate`.
+    async fn decide(
+        &self,
+        req: DecisionRequest,
+        policy: &ConfidencePolicy,
+    ) -> Result<(Answers, Option<ConfidenceAction>), HarnessError> {
+        let model = self
+            .decision
+            .as_deref()
+            .ok_or_else(|| HarnessError::Workflow("no decision model configured".into()))?;
+        let retry_req = (policy.on_low == ConfidenceAction::RetryStronger).then(|| req.clone());
+        let answers = model.evaluate(req).await?.answers;
+        if confidence(&answers) >= policy.min_confidence {
+            return Ok((answers, None));
+        }
+        match (policy.on_low, retry_req) {
+            (ConfidenceAction::Continue, _) => Ok((answers, None)),
+            (ConfidenceAction::RetryStronger, Some(req)) => {
+                let stronger = self.stronger_decision.as_deref().ok_or_else(|| {
+                    HarnessError::Workflow("no stronger decision model configured".into())
+                })?;
+                let answers = stronger.evaluate(req).await?.answers;
+                if confidence(&answers) >= policy.min_confidence {
+                    Ok((answers, None))
+                } else {
+                    Ok((answers, Some(ConfidenceAction::Escalate)))
+                }
+            }
+            (action, _) => Ok((answers, Some(action))),
         }
     }
+}
+
+/// The lowest confidence across a decision's answers. No answers, or a NaN
+/// confidence, counts as 0.0.
+fn confidence(answers: &Answers) -> f64 {
+    answers
+        .values()
+        .map(|a| {
+            if a.confidence.is_nan() {
+                0.0
+            } else {
+                a.confidence
+            }
+        })
+        .reduce(f64::min)
+        .unwrap_or(0.0)
 }
 
 /// The subset of `state` named by `reads`. Missing keys are left out.

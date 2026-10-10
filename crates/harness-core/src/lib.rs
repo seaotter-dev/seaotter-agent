@@ -37,7 +37,7 @@ pub use error::HarnessError;
 pub use event::{Event, EventKind, Usage};
 pub use future::BoxFuture;
 pub use generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, JsonSchema, OutputSpec};
-pub use machine::{Machine, MachineBuilder, Run};
+pub use machine::{Machine, MachineBuilder, Run, RunStatus};
 pub use node::{Gate, Node, NodeId, Step};
 pub use policy::{ConfidenceAction, ConfidencePolicy};
 pub use state::State;

@@ -6,7 +6,7 @@ use harness_core::{
     Answer, BoxFuture, Capability, ConfidenceAction, ConfidencePolicy, DecisionModel,
     DecisionRequest, DecisionResponse, Effect, Gate, GenOutput, GenRequest, GenResponse,
     GenerativeModel, HarnessError, JsonSchema, Machine, Next, Node, NodeId, Outcome, OutputSpec,
-    Question, State, Usage, Workflow,
+    Question, RunStatus, State, Usage, Workflow,
 };
 use serde_json::{Value, json};
 
@@ -138,7 +138,7 @@ fn reply_schema() -> OutputSpec {
     })))
 }
 
-fn ticket_workflow() -> Workflow {
+fn ticket_workflow(on_low: ConfidenceAction) -> Workflow {
     let nodes = vec![
         Node::Deterministic {
             id: "normalize".into(),
@@ -159,7 +159,7 @@ fn ticket_workflow() -> Workflow {
             )]),
             policy: ConfidencePolicy {
                 min_confidence: 0.7,
-                on_low: ConfidenceAction::Escalate,
+                on_low,
             },
         },
         Node::Generate {
@@ -200,7 +200,7 @@ async fn mixed_workflow_runs_deterministic_decide_and_generate() {
     let machine = Machine::builder().decision(dm).generative(gm).build();
 
     let run = machine
-        .run(&ticket_workflow(), ticket_state())
+        .run(&ticket_workflow(ConfidenceAction::Escalate), ticket_state())
         .await
         .unwrap();
 
@@ -209,6 +209,7 @@ async fn mixed_workflow_runs_deterministic_decide_and_generate() {
     assert_eq!(run.state["route"]["route"]["confidence"], json!(0.9));
     assert_eq!(run.state["draft"], json!({"reply": "Refund issued."}));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(run.status, RunStatus::Completed);
 }
 
 #[tokio::test]
@@ -218,7 +219,7 @@ async fn decide_receives_only_its_state_slice() {
     let machine = Machine::builder().decision(dm).generative(gm).build();
 
     machine
-        .run(&ticket_workflow(), ticket_state())
+        .run(&ticket_workflow(ConfidenceAction::Escalate), ticket_state())
         .await
         .unwrap();
 
@@ -233,8 +234,10 @@ async fn closed_gate_skips_generation() {
     let (gm, calls) = generator(GenOutput::Json(json!({"reply": "unused"})));
     let machine = Machine::builder().decision(dm).generative(gm).build();
 
+    // `Continue` accepts the low-confidence answer, so the run reaches `draft`
+    // and the gate closes on confidence.
     let run = machine
-        .run(&ticket_workflow(), ticket_state())
+        .run(&ticket_workflow(ConfidenceAction::Continue), ticket_state())
         .await
         .unwrap();
 
@@ -242,6 +245,7 @@ async fn closed_gate_skips_generation() {
     assert_eq!(calls.load(Ordering::SeqCst), 0);
     assert!(!run.state.contains_key("draft"));
     assert_eq!(run.state["escalated"], json!(true));
+    assert_eq!(run.status, RunStatus::Completed);
 }
 
 #[tokio::test]
@@ -255,7 +259,7 @@ async fn schema_invalid_output_stops_the_run() {
         let machine = Machine::builder().decision(dm).generative(gm).build();
 
         let err = machine
-            .run(&ticket_workflow(), ticket_state())
+            .run(&ticket_workflow(ConfidenceAction::Escalate), ticket_state())
             .await
             .unwrap_err();
         assert!(matches!(err, HarnessError::SchemaInvalid(_)), "{err}");
@@ -284,6 +288,7 @@ async fn explicit_free_text_accepts_text() {
         .await
         .unwrap();
     assert_eq!(run.state["note"], json!("hello"));
+    assert_eq!(run.status, RunStatus::Completed);
 }
 
 fn effect_workflow() -> Workflow {
@@ -322,6 +327,7 @@ async fn effect_requires_granted_capability() {
         .unwrap();
     assert_eq!(run.state["fetch"], json!({"subject": "  Refund PLEASE "}));
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(run.status, RunStatus::Completed);
 }
 
 #[tokio::test]
@@ -335,7 +341,7 @@ async fn misconfiguration_is_a_workflow_error() {
 
     let err = Machine::builder()
         .build()
-        .run(&ticket_workflow(), ticket_state())
+        .run(&ticket_workflow(ConfidenceAction::Escalate), ticket_state())
         .await
         .unwrap_err();
     assert!(matches!(err, HarnessError::Workflow(_)), "{err}");

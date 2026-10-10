@@ -6,6 +6,7 @@ use crate::decision::Answer;
 use crate::error::HarnessError;
 use crate::generate::GenOutput;
 use crate::node::{Node, NodeId};
+use crate::policy::ConfidenceAction;
 use crate::state::State;
 
 /// What a node produced. Data only; it never names the next node.
@@ -34,11 +35,15 @@ pub enum Next {
 pub type Transition = fn(&NodeId, &Outcome, &State) -> Next;
 
 /// An explicit node graph: Rust-built nodes plus a Rust transition function.
+///
+/// Low-confidence decisions bypass the transition and go to the handler
+/// registered with [`Workflow::on_low`], or halt the run if there is none.
 #[derive(Debug, Clone)]
 pub struct Workflow {
     start: NodeId,
     nodes: BTreeMap<NodeId, Node>,
     transition: Transition,
+    handlers: BTreeMap<ConfidenceAction, NodeId>,
 }
 
 impl Workflow {
@@ -79,7 +84,38 @@ impl Workflow {
             start,
             nodes: map,
             transition,
+            handlers: BTreeMap::new(),
         })
+    }
+
+    /// Routes low-confidence decisions that resolve to `action` to `handler`.
+    ///
+    /// Only `Escalate`, `SafeDefault`, and `Human` are edges; `Continue` and
+    /// `RetryStronger` are rejected, as is an undefined handler node.
+    pub fn on_low(
+        mut self,
+        action: ConfidenceAction,
+        handler: NodeId,
+    ) -> Result<Self, HarnessError> {
+        if matches!(
+            action,
+            ConfidenceAction::Continue | ConfidenceAction::RetryStronger
+        ) {
+            return Err(HarnessError::Workflow(format!(
+                "{action:?} is not a low-confidence edge"
+            )));
+        }
+        if !self.nodes.contains_key(&handler) {
+            return Err(HarnessError::Workflow(format!(
+                "handler node `{handler}` is not defined"
+            )));
+        }
+        self.handlers.insert(action, handler);
+        Ok(self)
+    }
+
+    pub fn handler(&self, action: ConfidenceAction) -> Option<&NodeId> {
+        self.handlers.get(&action)
     }
 
     pub fn start(&self) -> &NodeId {
