@@ -1,0 +1,17 @@
+[package]
+name = "measure"
+description = "Micro-benchmark of the ticket router and gated generation against a ReAct loop."
+publish = false
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-core.workspace = true
+harness-providers.workspace = true
+ticket-router = { path = "../ticket-router" }
+gated-generate = { path = "../gated-generate" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true

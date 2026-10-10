@@ -1,0 +1,176 @@
+{
+  "workflow": "gated-generate",
+  "fixture": "examples/gated-generate/fixtures/allow.json",
+  "repeats": 10,
+  "react_step_cap": 4,
+  "harness": {
+    "runs": [
+      {
+        "branch": "safe",
+        "latency_ms": 168,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 149,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 200,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 186,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 364,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 225,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 172,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 200,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 166,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      },
+      {
+        "branch": "safe",
+        "latency_ms": 171,
+        "input_tokens": 296,
+        "output_tokens": 20,
+        "steps": 1
+      }
+    ],
+    "summary": {
+      "runs": 10,
+      "modal_branch": "safe",
+      "stability": 1.0,
+      "branch_counts": {
+        "safe": 10
+      },
+      "mean_latency_ms": 200.1,
+      "mean_input_tokens": 296.0,
+      "mean_output_tokens": 20.0
+    }
+  },
+  "react": {
+    "runs": [
+      {
+        "branch": "drafted",
+        "latency_ms": 2600,
+        "input_tokens": 791,
+        "output_tokens": 220,
+        "steps": 3
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 3544,
+        "input_tokens": 1081,
+        "output_tokens": 230,
+        "steps": 4
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 2335,
+        "input_tokens": 798,
+        "output_tokens": 170,
+        "steps": 3
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 2148,
+        "input_tokens": 782,
+        "output_tokens": 184,
+        "steps": 3
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 2180,
+        "input_tokens": 787,
+        "output_tokens": 157,
+        "steps": 3
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 2690,
+        "input_tokens": 809,
+        "output_tokens": 231,
+        "steps": 3
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 2019,
+        "input_tokens": 788,
+        "output_tokens": 163,
+        "steps": 3
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 3275,
+        "input_tokens": 1104,
+        "output_tokens": 261,
+        "steps": 4
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 2507,
+        "input_tokens": 789,
+        "output_tokens": 207,
+        "steps": 3
+      },
+      {
+        "branch": "drafted",
+        "latency_ms": 2022,
+        "input_tokens": 775,
+        "output_tokens": 161,
+        "steps": 3
+      }
+    ],
+    "summary": {
+      "runs": 10,
+      "modal_branch": "drafted",
+      "stability": 1.0,
+      "branch_counts": {
+        "drafted": 10
+      },
+      "mean_latency_ms": 2532.0,
+      "mean_input_tokens": 850.4,
+      "mean_output_tokens": 198.4
+    }
+  }
+}
