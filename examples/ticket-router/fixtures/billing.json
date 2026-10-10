@@ -1,0 +1,20 @@
+{
+  "ticket": {
+    "subject": "  Refund for a duplicate charge  ",
+    "body": "  I was charged twice on invoice 1042. Please refund the second payment.  "
+  },
+  "answer": {
+    "probabilities": {
+      "account": 0.03,
+      "billing": 0.91,
+      "technical": 0.06
+    },
+    "confidence": 0.88
+  },
+  "usage": {
+    "latency_ms": 140,
+    "input_tokens": 96,
+    "output_tokens": 24,
+    "cost_usd": 0.00012
+  }
+}

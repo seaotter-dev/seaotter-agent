@@ -1657,8 +1657,9 @@ name = "ticket-router"
 version = "0.1.0"
 dependencies = [
  "harness-core",
- "harness-effects",
  "harness-providers",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
