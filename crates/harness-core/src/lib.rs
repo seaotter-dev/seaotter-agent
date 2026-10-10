@@ -36,7 +36,7 @@ pub use decision::{
 };
 pub use effect::{Capability, Effect};
 pub use error::HarnessError;
-pub use event::{Event, EventKind, Usage};
+pub use event::{Event, EventKind, EventLog, Usage, input_hash};
 pub use future::BoxFuture;
 pub use generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, JsonSchema, OutputSpec};
 pub use machine::{Machine, MachineBuilder, Run, RunStatus};
