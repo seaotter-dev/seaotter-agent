@@ -1,0 +1,25 @@
+{
+  "request": "  Please refund the duplicate charge on invoice 1042.  ",
+  "answer": {
+    "probabilities": {
+      "false": 0.07,
+      "true": 0.93
+    },
+    "confidence": 0.86
+  },
+  "decision_usage": {
+    "latency_ms": 90,
+    "input_tokens": 48,
+    "output_tokens": 12,
+    "cost_usd": 0.00004
+  },
+  "output": {
+    "reply": "I refunded the duplicate charge on invoice 1042."
+  },
+  "generation_usage": {
+    "latency_ms": 320,
+    "input_tokens": 180,
+    "output_tokens": 64,
+    "cost_usd": 0.00048
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "request": "Something is wrong.",
+  "answer": {
+    "probabilities": {
+      "false": 0.45,
+      "true": 0.55
+    },
+    "confidence": 0.41
+  },
+  "decision_usage": {
+    "latency_ms": 70,
+    "input_tokens": 30,
+    "output_tokens": 8,
+    "cost_usd": 0.00002
+  },
+  "output": {
+    "reply": "This draft must not be produced."
+  },
+  "generation_usage": {
+    "latency_ms": 300,
+    "input_tokens": 100,
+    "output_tokens": 20,
+    "cost_usd": 0.0004
+  }
+}
