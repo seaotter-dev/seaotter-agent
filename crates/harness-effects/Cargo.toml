@@ -1,0 +1,10 @@
+[package]
+name = "harness-effects"
+description = "Capability-scoped effects executed by Rust for the harness."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-core.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "harness-core"
+description = "Code-owned agent harness: Machine, node graph, model traits, and event log."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

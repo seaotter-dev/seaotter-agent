@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "examples/*"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/seaotter-dev/seaotter-agent"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+harness-core = { path = "crates/harness-core" }
+harness-providers = { path = "crates/harness-providers" }
+harness-effects = { path = "crates/harness-effects" }

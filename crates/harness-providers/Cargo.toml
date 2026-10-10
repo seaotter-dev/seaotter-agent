@@ -1,0 +1,10 @@
+[package]
+name = "harness-providers"
+description = "System One decision clients and schema-bounded generative clients for the harness."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-core.workspace = true
