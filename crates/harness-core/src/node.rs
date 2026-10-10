@@ -63,5 +63,17 @@ pub enum Node {
     Effect {
         id: NodeId,
         name: String,
+        reads: Vec<String>,
     },
+}
+
+impl Node {
+    pub fn id(&self) -> &NodeId {
+        match self {
+            Self::Deterministic { id, .. }
+            | Self::Decide { id, .. }
+            | Self::Generate { id, .. }
+            | Self::Effect { id, .. } => id,
+        }
+    }
 }

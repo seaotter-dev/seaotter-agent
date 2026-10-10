@@ -215,6 +215,7 @@ fn nodes_cover_every_variant() {
         Node::Effect {
             id: "fetch".into(),
             name: "upper".into(),
+            reads: vec!["subject".into()],
         },
     ];
     assert_eq!(nodes.len(), 4);
