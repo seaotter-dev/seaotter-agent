@@ -4,9 +4,32 @@
 //! `GenerativeModel`, and `Effect` traits, and the append-only event log.
 //! Code owns control flow: the next step is always a Rust match or
 //! state-machine transition, never model output. See `SPEC.md`.
+//!
+//! # What models cannot do
+//!
+//! - No request carries a tool list, and no response carries tool calls, a
+//!   next node, or memory writes.
+//! - [`Node`] values are built in Rust. [`Node::Effect`] names an effect in
+//!   code, never from model output.
+//! - [`State`] is changed only by deterministic steps and the machine. Model
+//!   responses return data, not state edits.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_builds() {}
-}
+mod decision;
+mod effect;
+mod error;
+mod event;
+mod future;
+mod generate;
+mod node;
+mod policy;
+mod state;
+
+pub use decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse, Question};
+pub use effect::{Capability, Effect};
+pub use error::HarnessError;
+pub use event::{Event, EventKind, Usage};
+pub use future::BoxFuture;
+pub use generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, JsonSchema, OutputSpec};
+pub use node::{Gate, Node, NodeId, Step};
+pub use policy::{ConfidenceAction, ConfidencePolicy};
+pub use state::State;
