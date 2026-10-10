@@ -1,0 +1,8 @@
+{
+  "question": "route",
+  "probabilities": { "billing": 0.82, "technical": 0.18 },
+  "confidence": 0.9,
+  "expect": "billing",
+  "min_confidence": 0.8,
+  "max_confidence": 1.0
+}

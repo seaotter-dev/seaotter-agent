@@ -22,6 +22,7 @@ mod decision;
 mod diff;
 mod effect;
 mod error;
+mod eval;
 mod event;
 mod future;
 mod generate;
@@ -39,6 +40,7 @@ pub use decision::{
 pub use diff::{Divergence, diff_runs};
 pub use effect::{Capability, Effect};
 pub use error::HarnessError;
+pub use eval::{FixtureError, check_answer_fixture, check_branch_fixture};
 pub use event::{Event, EventKind, EventLog, Usage, input_hash};
 pub use future::BoxFuture;
 pub use generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, JsonSchema, OutputSpec};
