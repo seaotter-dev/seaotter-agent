@@ -1,0 +1,176 @@
+{
+  "workflow": "ticket-router",
+  "fixture": "examples/ticket-router/fixtures/billing.json",
+  "repeats": 10,
+  "react_step_cap": 4,
+  "harness": {
+    "runs": [
+      {
+        "branch": "billing",
+        "latency_ms": 202,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 171,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 218,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 209,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 207,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 171,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 180,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 146,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 258,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 134,
+        "input_tokens": 422,
+        "output_tokens": 38,
+        "steps": 1
+      }
+    ],
+    "summary": {
+      "runs": 10,
+      "modal_branch": "billing",
+      "stability": 1.0,
+      "branch_counts": {
+        "billing": 10
+      },
+      "mean_latency_ms": 189.6,
+      "mean_input_tokens": 422.0,
+      "mean_output_tokens": 38.0
+    }
+  },
+  "react": {
+    "runs": [
+      {
+        "branch": "billing",
+        "latency_ms": 2737,
+        "input_tokens": 446,
+        "output_tokens": 64,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 1648,
+        "input_tokens": 449,
+        "output_tokens": 70,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 1570,
+        "input_tokens": 446,
+        "output_tokens": 72,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 1510,
+        "input_tokens": 446,
+        "output_tokens": 62,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 1798,
+        "input_tokens": 441,
+        "output_tokens": 64,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 1900,
+        "input_tokens": 440,
+        "output_tokens": 66,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 1337,
+        "input_tokens": 443,
+        "output_tokens": 58,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 1682,
+        "input_tokens": 451,
+        "output_tokens": 70,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 1568,
+        "input_tokens": 447,
+        "output_tokens": 73,
+        "steps": 2
+      },
+      {
+        "branch": "billing",
+        "latency_ms": 2484,
+        "input_tokens": 443,
+        "output_tokens": 65,
+        "steps": 2
+      }
+    ],
+    "summary": {
+      "runs": 10,
+      "modal_branch": "billing",
+      "stability": 1.0,
+      "branch_counts": {
+        "billing": 10
+      },
+      "mean_latency_ms": 1823.4,
+      "mean_input_tokens": 445.2,
+      "mean_output_tokens": 66.4
+    }
+  }
+}

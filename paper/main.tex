@@ -17,10 +17,9 @@ is handed an open tool list. This paper describes a code-owned harness. A Rust
 transition chooses the next step. System One models answer typed questions and
 return probabilities and a confidence the machine can branch on. Generative
 models run only inside an explicit node with a schema and a token cap, usually
-after a gate. Effects run in Rust under a granted capability. A later
-measurement will compare tokens, latency, and branch stability with a
-ReAct-style baseline on the same generative model. This draft does not report
-those numbers.
+after a gate. Effects run in Rust under a granted capability.
+Section~\ref{sec:evaluation} quotes tokens, latency, and branch stability
+for two fixtures against a ReAct-style baseline on the same generative model.
 \end{abstract}
 
 \section{Problem}
@@ -50,10 +49,10 @@ The implementation is a small Rust library~\cite{seaotter-agent}.
 
 Yao et al.\ introduce ReAct, which prompts a language model to alternate
 between a reasoning trace and an action, and to stop when the model emits a
-finish action~\cite{yao2023react}. The evaluation in this paper will use a
-ReAct-style loop on the same generative model as its baseline. That comparison
-is not in this draft. Section~\ref{sec:evaluation} names the measures and
-leaves the numbers for a later measurement run.
+finish action~\cite{yao2023react}. The evaluation uses a ReAct-style loop on
+the same generative model as its baseline.
+Section~\ref{sec:evaluation} quotes the measured tokens, latency, and branch
+stability.
 
 Hermes and OpenClaw are production forms of a model-owned loop. Hermes
 dispatches tools from an agent object, persists memory, and can create skills
@@ -129,15 +128,46 @@ answer skips the model. Low confidence never visits the draft node.
 \section{Evaluation}
 \label{sec:evaluation}
 
-\begin{quote}
-\noindent\textbf{Filled by measurement, not by estimate.}
-This section will quote raw results from \texttt{paper/measurements/}.
-The measures are tokens, latency, and branch stability across repeated runs
-of the same fixtures. The baseline is a ReAct-style loop that uses the same
-generative model as the harness. The note that accompanies the results will
-name the model, the fixtures, and the command that reruns them.
-This draft contains no measured values.
-\end{quote}
+The baseline is a ReAct-style loop on the same OpenAI-compatible model the
+harness uses for its generative draft, \texttt{gpt-4.1-mini-2025-04-14}.
+Harness decisions use the System One model \texttt{jev-latest}.
+Each ReAct step returns a thought and an action that matches a JSON schema.
+The action \texttt{inspect} returns the fixture text.
+The action \texttt{finish} ends the loop.
+A loop that reaches four steps without finishing is branch \texttt{unfinished}.
+Raw runs, the fixture paths, and the rerun command are in
+\texttt{paper/measurements/}.
+
+Ten sequential runs of \texttt{examples/ticket-router/fixtures/billing.json}
+route one support ticket.
+The harness is one System One choice.
+It records ticket harness modal branch billing,
+ticket harness stability 10/10,
+ticket harness mean latency 189.6 ms,
+ticket harness mean input tokens 422.0,
+and ticket harness mean output tokens 38.0.
+The ReAct baseline records ticket ReAct modal branch billing,
+ticket ReAct stability 10/10,
+ticket ReAct mean latency 1823.4 ms,
+ticket ReAct mean input tokens 445.2,
+and ticket ReAct mean output tokens 66.4.
+
+Ten sequential runs of \texttt{examples/gated-generate/fixtures/allow.json}
+decide whether a reply may be drafted.
+The harness asks a System One yes-or-no question and drafts only when that
+gate allows.
+On these runs the destination was \texttt{safe} after the decision step.
+It records gated harness modal branch safe,
+gated harness stability 10/10,
+gated harness mean latency 200.1 ms,
+gated harness mean input tokens 296.0,
+and gated harness mean output tokens 20.0.
+The ReAct baseline decides and drafts inside the same generative loop.
+It records gated ReAct modal branch drafted,
+gated ReAct stability 10/10,
+gated ReAct mean latency 2532.0 ms,
+gated ReAct mean input tokens 850.4,
+and gated ReAct mean output tokens 198.4.
 
 \section{Limitations and future work}
 \label{sec:limits}
@@ -146,11 +176,10 @@ Version~1 is a single-workflow library. It does not include a skill
 marketplace, model-owned memory writes, multi-agent routing, a gateway, or an
 open tool list. The model does not choose the next step.
 
-The evaluation planned above is a micro-benchmark on two or three workflows.
-It is not a field study of production tickets, and it does not claim a win
-until the measurement files exist. Affiliation is omitted on this title page
-and will be added before submission. Endorsement for a first arXiv deposit
-is a submit-time step, not a result of this draft.
+The evaluation above is a micro-benchmark on two workflows.
+It is not a field study of production tickets. Affiliation is omitted on this
+title page and will be added before submission. Endorsement for a first arXiv
+deposit is a submit-time step, not a result of this draft.
 
 \section{Conclusion}
 \label{sec:conclusion}
