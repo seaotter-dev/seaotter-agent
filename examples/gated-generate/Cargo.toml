@@ -1,0 +1,14 @@
+[package]
+name = "gated-generate"
+description = "Example: a System One gate, one schema-bound generative call, then Rust validation."
+publish = false
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+harness-core.workspace = true
+harness-providers.workspace = true
+harness-effects.workspace = true
+tokio.workspace = true
