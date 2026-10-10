@@ -9,9 +9,14 @@
 //!   ([`Capability::FileRead`](harness_core::Capability::FileRead)).
 //! - [`HttpGet`]: GETs URLs on an explicit host allowlist
 //!   ([`Capability::HttpGet`](harness_core::Capability::HttpGet)).
+//! - [`Shell`]: runs one fixed argv with an empty environment
+//!   ([`Capability::DangerousShell`](harness_core::Capability::DangerousShell)).
+//!   Never registered or granted by default.
 
 mod file_read;
 mod http_get;
+mod shell;
 
 pub use file_read::FileRead;
 pub use http_get::HttpGet;
+pub use shell::Shell;
