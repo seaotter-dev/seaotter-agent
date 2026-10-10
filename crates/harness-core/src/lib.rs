@@ -13,6 +13,10 @@
 //!   code, never from model output.
 //! - [`State`] is changed only by deterministic steps and the machine. Model
 //!   responses return data, not state edits.
+//! - The [`Machine`] picks the next node only through the workflow's
+//!   [`Transition`], a Rust function.
+//! - Question or node skeletons generated at design time are written to files
+//!   for review. The harness has no path to compile or run generated Rust.
 
 mod decision;
 mod effect;
@@ -20,9 +24,12 @@ mod error;
 mod event;
 mod future;
 mod generate;
+mod machine;
 mod node;
 mod policy;
 mod state;
+mod validate;
+mod workflow;
 
 pub use decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse, Question};
 pub use effect::{Capability, Effect};
@@ -30,6 +37,8 @@ pub use error::HarnessError;
 pub use event::{Event, EventKind, Usage};
 pub use future::BoxFuture;
 pub use generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, JsonSchema, OutputSpec};
+pub use machine::{Machine, MachineBuilder, Run};
 pub use node::{Gate, Node, NodeId, Step};
 pub use policy::{ConfidenceAction, ConfidencePolicy};
 pub use state::State;
+pub use workflow::{Next, Outcome, Transition, Workflow};
