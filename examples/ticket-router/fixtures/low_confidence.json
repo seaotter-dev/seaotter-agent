@@ -1,0 +1,20 @@
+{
+  "ticket": {
+    "subject": "Something is wrong",
+    "body": "It does not work the way I expected."
+  },
+  "answer": {
+    "probabilities": {
+      "account": 0.2,
+      "billing": 0.5,
+      "technical": 0.3
+    },
+    "confidence": 0.42
+  },
+  "usage": {
+    "latency_ms": 210,
+    "input_tokens": 110,
+    "output_tokens": 30,
+    "cost_usd": 0.00018
+  }
+}
