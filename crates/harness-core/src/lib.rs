@@ -33,7 +33,8 @@ mod validate;
 mod workflow;
 
 pub use decision::{
-    Answer, DecisionModel, DecisionRequest, DecisionResponse, NoulCriteria, Question,
+    Answer, DecisionModel, DecisionRequest, DecisionRequestBuilder, DecisionResponse, NoulCriteria,
+    Question,
 };
 pub use diff::{Divergence, diff_runs};
 pub use effect::{Capability, Effect};

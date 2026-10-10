@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +29,68 @@ pub enum Question {
     },
 }
 
+impl Question {
+    /// A `Choice` question. A repeated label is an error.
+    pub fn choice<I, A, B>(
+        instructions: impl Into<String>,
+        criteria: I,
+    ) -> Result<Self, HarnessError>
+    where
+        I: IntoIterator<Item = (A, B)>,
+        A: Into<String>,
+        B: Into<String>,
+    {
+        let mut labels = BTreeMap::new();
+        for (label, description) in criteria {
+            let label = label.into();
+            if labels.insert(label.clone(), description.into()).is_some() {
+                return Err(HarnessError::Workflow(format!(
+                    "choice label `{label}` is repeated"
+                )));
+            }
+        }
+        Ok(Self::Choice {
+            instructions: instructions.into(),
+            criteria: labels,
+        })
+    }
+
+    /// A `Score` question. `criteria` is ordered low to high.
+    pub fn score<I, S>(instructions: impl Into<String>, criteria: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::Score {
+            instructions: instructions.into(),
+            criteria: criteria.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// A yes-or-no question with no description of either answer.
+    pub fn noul(instructions: impl Into<String>) -> Self {
+        Self::Noul {
+            instructions: instructions.into(),
+            criteria: None,
+        }
+    }
+
+    /// A yes-or-no question that says what each answer means.
+    pub fn noul_meanings(
+        instructions: impl Into<String>,
+        yes: impl Into<String>,
+        no: impl Into<String>,
+    ) -> Self {
+        Self::Noul {
+            instructions: instructions.into(),
+            criteria: Some(NoulCriteria {
+                yes: yes.into(),
+                no: no.into(),
+            }),
+        }
+    }
+}
+
 /// What a yes and a no mean for a `Noul` question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoulCriteria {
@@ -43,6 +105,69 @@ pub struct NoulCriteria {
 pub struct DecisionRequest {
     pub state: State,
     pub questions: BTreeMap<String, Question>,
+}
+
+impl DecisionRequest {
+    /// Starts a request whose state may contain only `reads`.
+    pub fn builder<I, S>(reads: I) -> DecisionRequestBuilder
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        DecisionRequestBuilder {
+            reads: reads.into_iter().map(Into::into).collect(),
+            state: State::new(),
+            questions: BTreeMap::new(),
+        }
+    }
+}
+
+/// Builds a [`DecisionRequest`]. `set` rejects a key that is not in `reads`.
+#[derive(Debug, Clone)]
+pub struct DecisionRequestBuilder {
+    reads: BTreeSet<String>,
+    state: State,
+    questions: BTreeMap<String, Question>,
+}
+
+impl DecisionRequestBuilder {
+    /// Stores `value` under `key`. A key the node did not read is an error and
+    /// is not stored.
+    pub fn set(
+        mut self,
+        key: impl Into<String>,
+        value: impl Serialize,
+    ) -> Result<Self, HarnessError> {
+        let key = key.into();
+        if !self.reads.contains(&key) {
+            return Err(HarnessError::Workflow(format!(
+                "state key `{key}` is not read by this decision"
+            )));
+        }
+        let value = serde_json::to_value(value)
+            .map_err(|e| HarnessError::Workflow(format!("state value for `{key}`: {e}")))?;
+        self.state.insert(key, value);
+        Ok(self)
+    }
+
+    /// Adds a question. A repeated key is an error.
+    pub fn ask(mut self, key: impl Into<String>, question: Question) -> Result<Self, HarnessError> {
+        let key = key.into();
+        if self.questions.contains_key(&key) {
+            return Err(HarnessError::Workflow(format!(
+                "question `{key}` is already set"
+            )));
+        }
+        self.questions.insert(key, question);
+        Ok(self)
+    }
+
+    pub fn build(self) -> DecisionRequest {
+        DecisionRequest {
+            state: self.state,
+            questions: self.questions,
+        }
+    }
 }
 
 /// Probabilities over answer labels and the model's confidence.
