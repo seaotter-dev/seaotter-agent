@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use harness_core::{
     Answer, BoxFuture, DecisionModel, DecisionRequest, DecisionResponse, HarnessError,
@@ -14,9 +14,10 @@ use harness_core::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::http::post_json;
+
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 pub const DEFAULT_MODEL: &str = "jev-latest";
-const ERROR_BODY_LIMIT: usize = 500;
 
 /// Where and how to reach a System One endpoint.
 #[derive(Clone)]
@@ -96,27 +97,14 @@ impl DecisionModel for TypeSafeDecision {
     ) -> BoxFuture<'_, Result<DecisionResponse, HarnessError>> {
         Box::pin(async move {
             let body = to_wire(&req, &self.config.model);
-            let started = Instant::now();
-            let resp = self
-                .client
-                .post(self.url())
-                .bearer_auth(&self.config.api_key)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| HarnessError::Provider(format!("typesafe request: {e}")))?;
-            let status = resp.status();
-            let text = resp
-                .text()
-                .await
-                .map_err(|e| HarnessError::Provider(format!("typesafe response: {e}")))?;
-            let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            if !status.is_success() {
-                let snippet: String = text.chars().take(ERROR_BODY_LIMIT).collect();
-                return Err(HarnessError::Provider(format!(
-                    "typesafe returned {status}: {snippet}"
-                )));
-            }
+            let (text, latency_ms) = post_json(
+                &self.client,
+                "typesafe",
+                &self.url(),
+                &self.config.api_key,
+                &body,
+            )
+            .await?;
             let wire: WireResponse = serde_json::from_str(&text)
                 .map_err(|e| HarnessError::Provider(format!("typesafe response json: {e}")))?;
             from_wire(wire, &req.questions, latency_ms)

@@ -1,0 +1,22 @@
+{
+  "id": "chatcmpl-fixture-text",
+  "object": "chat.completion",
+  "created": 1791648000,
+  "model": "grok-4",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Thanks for reaching out. We'll send a prepaid return label today.",
+        "refusal": null
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 98,
+    "completion_tokens": 16,
+    "total_tokens": 114
+  }
+}

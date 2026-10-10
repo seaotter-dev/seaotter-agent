@@ -43,4 +43,5 @@ pub use machine::{Machine, MachineBuilder, Run, RunStatus};
 pub use node::{Gate, Node, NodeId, Step};
 pub use policy::{ConfidenceAction, ConfidencePolicy};
 pub use state::State;
+pub use validate::validate_output;
 pub use workflow::{Next, Outcome, Transition, Workflow};
