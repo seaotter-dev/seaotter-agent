@@ -1,24 +1,18 @@
 use std::time::Instant;
 
 use harness_core::HarnessError;
-use serde::Serialize;
 
 const ERROR_BODY_LIMIT: usize = 500;
 
-/// POSTs `body` as JSON with Bearer auth. Returns the response text and the
-/// round-trip latency in milliseconds. `provider` prefixes error messages.
-pub(crate) async fn post_json<B: Serialize + ?Sized>(
-    client: &reqwest::Client,
+/// Sends a request the caller has built (URL, auth headers, JSON body).
+/// Returns the response text and the round-trip latency in milliseconds.
+/// `provider` prefixes error messages.
+pub(crate) async fn send_json(
     provider: &str,
-    url: &str,
-    api_key: &str,
-    body: &B,
+    req: reqwest::RequestBuilder,
 ) -> Result<(String, u64), HarnessError> {
     let started = Instant::now();
-    let resp = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(body)
+    let resp = req
         .send()
         .await
         .map_err(|e| HarnessError::Provider(format!("{provider} request: {e}")))?;

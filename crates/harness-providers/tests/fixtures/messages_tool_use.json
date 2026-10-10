@@ -1,0 +1,24 @@
+{
+  "id": "msg_fixture_tools",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-sonnet-5-5",
+  "content": [
+    {
+      "type": "text",
+      "text": "I'll issue the refund now."
+    },
+    {
+      "type": "tool_use",
+      "id": "toolu_1",
+      "name": "issue_refund",
+      "input": {"order": "A-1001"}
+    }
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 140,
+    "output_tokens": 30
+  }
+}

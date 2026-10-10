@@ -14,11 +14,11 @@ use harness_core::{
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
-use crate::http::post_json;
+use crate::http::send_json;
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
-const SYSTEM_PROMPT: &str = "Complete the task in a single response. Return only the requested \
+pub(crate) const SYSTEM_PROMPT: &str = "Complete the task in a single response. Return only the requested \
 output. Do not ask follow-up questions, call tools, or plan further steps.";
 
 /// How a schema-bound request asks the endpoint for JSON.
@@ -141,14 +141,12 @@ impl GenerativeModel for OpenAiCompatible {
     fn complete(&self, req: GenRequest) -> BoxFuture<'_, Result<GenResponse, HarnessError>> {
         Box::pin(async move {
             let body = to_wire(&req, &self.config);
-            let (text, latency_ms) = post_json(
-                &self.client,
-                "openai",
-                &self.url(),
-                &self.config.api_key,
-                &body,
-            )
-            .await?;
+            let http = self
+                .client
+                .post(self.url())
+                .bearer_auth(&self.config.api_key)
+                .json(&body);
+            let (text, latency_ms) = send_json("openai", http).await?;
             let wire: Value = serde_json::from_str(&text)
                 .map_err(|e| HarnessError::Provider(format!("openai response json: {e}")))?;
             from_wire(wire, &req.output, latency_ms)
