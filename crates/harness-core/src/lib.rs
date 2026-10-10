@@ -31,7 +31,9 @@ mod state;
 mod validate;
 mod workflow;
 
-pub use decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse, Question};
+pub use decision::{
+    Answer, DecisionModel, DecisionRequest, DecisionResponse, NoulCriteria, Question,
+};
 pub use effect::{Capability, Effect};
 pub use error::HarnessError;
 pub use event::{Event, EventKind, Usage};

@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use harness_core::{
     Answer, BoxFuture, Capability, ConfidenceAction, ConfidencePolicy, DecisionModel,
     DecisionRequest, DecisionResponse, Effect, Event, EventKind, Gate, GenOutput, GenRequest,
-    GenResponse, GenerativeModel, HarnessError, JsonSchema, Node, OutputSpec, Question, State,
-    Usage,
+    GenResponse, GenerativeModel, HarnessError, JsonSchema, Node, NoulCriteria, OutputSpec,
+    Question, State, Usage,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -147,6 +147,18 @@ fn types_roundtrip_through_json() {
     roundtrip(&route_question());
     roundtrip(&Question::Noul {
         instructions: "Is this spam?".into(),
+        criteria: None,
+    });
+    roundtrip(&Question::Noul {
+        instructions: "Has the customer contacted support before?".into(),
+        criteria: Some(NoulCriteria {
+            yes: "Mentions a prior attempt".into(),
+            no: "No sign of previous contact".into(),
+        }),
+    });
+    roundtrip(&Question::Score {
+        instructions: "How severe is the issue?".into(),
+        criteria: vec!["Cosmetic".into(), "Degraded".into(), "Blocking".into()],
     });
     roundtrip(&DecisionResponse {
         answers: BTreeMap::from([("route".into(), answer(&[("billing", 1.0)], 0.95))]),
