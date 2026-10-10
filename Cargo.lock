@@ -408,6 +408,7 @@ name = "harness-effects"
 version = "0.1.0"
 dependencies = [
  "harness-core",
+ "reqwest",
  "serde_json",
  "tempfile",
  "tokio",
