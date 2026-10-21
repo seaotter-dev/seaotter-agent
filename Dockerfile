@@ -15,3 +15,8 @@ RUN apk add --no-cache ca-certificates
 COPY --from=build /out/ticket-router /out/gated-generate /usr/local/bin/
 COPY examples/ticket-router/fixtures /src/examples/ticket-router/fixtures
 COPY examples/gated-generate/fixtures /src/examples/gated-generate/fixtures
+RUN addgroup -g 10001 -S seaotter \
+    && adduser -u 10001 -S -D -H -G seaotter seaotter \
+    && mkdir -p /data \
+    && chown 10001:10001 /data
+USER seaotter
