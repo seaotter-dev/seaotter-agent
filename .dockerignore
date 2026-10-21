@@ -1,0 +1,7 @@
+target
+.git
+.vscode
+paper
+**/.env
+**/*.pem
+**/*credentials*
