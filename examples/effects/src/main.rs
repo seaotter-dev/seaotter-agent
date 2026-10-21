@@ -15,6 +15,7 @@ use serde_json::json;
 
 const WORKSPACE: &str = "/data/workspace";
 const NOTE: &str = "workspace note";
+const DEFAULT_HOST: &str = "example.com";
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -37,9 +38,11 @@ async fn exercise() -> Result<String, String> {
     let note = workspace.join("note.txt");
     std::fs::write(&note, NOTE).map_err(|err| format!("writing {}: {err}", note.display()))?;
 
+    let hosts = destination_hosts(std::env::var("HTTP_DESTINATIONS").ok().as_deref());
     let (read, read_events) = read_note(workspace).await?;
     let escaped = escape_rejected(workspace).await?;
-    let http = http_rejected().await?;
+    let http = http_rejected(&hosts).await?;
+    let narrowed = example_outside_list(&hosts).await?;
     let denied = shell_denied(workspace).await?;
     let (granted, shell_events) = shell_granted().await?;
     let mut events = read_events;
@@ -52,9 +55,35 @@ async fn exercise() -> Result<String, String> {
         &events,
     )
     .map_err(|err| err.to_string())?;
+    let narrowed = narrowed.map(|line| format!("\n{line}")).unwrap_or_default();
     Ok(format!(
-        "{read}\n{escaped}\n{http}\n{denied}\n{granted}\nrun_id: {id}"
+        "{read}\n{escaped}\n{http}{narrowed}\n{denied}\n{granted}\nrun_id: {id}"
     ))
+}
+
+/// Hosts for this example's `HttpGet`. An unset, empty, or blank value keeps
+/// the effect allowlist. `HTTP_DESTINATIONS` is not a credential.
+fn destination_hosts(configured: Option<&str>) -> Vec<String> {
+    let Some(configured) = configured.map(str::trim).filter(|value| !value.is_empty()) else {
+        return vec![DEFAULT_HOST.into()];
+    };
+    let hosts: Vec<String> = configured
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if hosts.is_empty() {
+        vec![DEFAULT_HOST.into()]
+    } else {
+        hosts
+    }
+}
+
+fn allows_default_host(hosts: &[String]) -> bool {
+    hosts
+        .iter()
+        .any(|host| host.eq_ignore_ascii_case(DEFAULT_HOST))
 }
 
 async fn read_note(root: &Path) -> Result<(String, Vec<Event>), String> {
@@ -95,8 +124,8 @@ async fn escape_rejected(root: &Path) -> Result<String, String> {
     expect_contains(&err, "escapes the root")
 }
 
-async fn http_rejected() -> Result<String, String> {
-    let effect = HttpGet::new(["example.com"]).map_err(show)?;
+async fn http_rejected(hosts: &[String]) -> Result<String, String> {
+    let effect = HttpGet::new(hosts).map_err(show)?;
     let err = machine(effect, Some(Capability::HttpGet))
         .run(
             &workflow("get", "http_get", &["url"]).map_err(show)?,
@@ -105,6 +134,21 @@ async fn http_rejected() -> Result<String, String> {
         .await
         .expect_err("a host outside the allowlist must be rejected");
     expect_contains(&err, "not on the allowlist")
+}
+
+async fn example_outside_list(hosts: &[String]) -> Result<Option<String>, String> {
+    if allows_default_host(hosts) {
+        return Ok(None);
+    }
+    let effect = HttpGet::new(hosts).map_err(show)?;
+    let err = machine(effect, Some(Capability::HttpGet))
+        .run(
+            &workflow("get", "http_get", &["url"]).map_err(show)?,
+            State::from([("url".into(), json!("https://example.com/"))]),
+        )
+        .await
+        .expect_err("a host outside the destination list must be rejected");
+    expect_contains(&err, "not on the allowlist").map(Some)
 }
 
 async fn shell_denied(root: &Path) -> Result<String, String> {
@@ -181,4 +225,31 @@ fn expect_contains(err: &HarnessError, needle: &str) -> Result<String, String> {
 
 fn show(err: HarnessError) -> String {
     err.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_HOST, destination_hosts};
+    use harness_effects::HttpGet;
+    use serde_json::json;
+
+    #[test]
+    fn unset_or_blank_keeps_the_effect_allowlist() {
+        assert_eq!(destination_hosts(None), [DEFAULT_HOST]);
+        assert_eq!(destination_hosts(Some("")), [DEFAULT_HOST]);
+        assert_eq!(destination_hosts(Some("  ")), [DEFAULT_HOST]);
+        assert_eq!(destination_hosts(Some(",")), [DEFAULT_HOST]);
+    }
+
+    #[test]
+    fn narrowed_list_rejects_example_com_before_a_send() {
+        let hosts = destination_hosts(Some("127.0.0.1"));
+        assert_eq!(hosts, ["127.0.0.1"]);
+        let effect = HttpGet::new(&hosts).unwrap();
+        let err = effect
+            .check(&json!({"url": "https://example.com/"}))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("not on the allowlist"), "{msg}");
+    }
 }
