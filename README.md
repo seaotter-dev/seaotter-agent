@@ -58,3 +58,11 @@ docker run --rm -v "$(pwd)/data:/data" \
 docker run --rm -v "$(pwd)/data:/data" --env-file .env \
   seaotter-agent:dev --workflow examples/gated-generate
 ```
+
+`examples/effects` runs `FileRead`, allowlisted `HttpGet`, and the shell inside the container. `FileRead` is rooted at `/data/workspace`. The shell stays off unless that binary grants it in Rust, and its argument vector is fixed there. No model is called.
+
+```sh
+docker run --rm -v "$(pwd)/data:/data" seaotter-agent:dev --workflow examples/effects
+```
+
+The default bridge network gives the container its own stack, so `127.0.0.1` inside it is not the host. `--network host` uses the host network namespace. On Docker Desktop that host is the Linux VM, so a service bound only to the Mac's localhost is still unreachable. Neither mode widens the `HttpGet` allowlist or grants the shell.

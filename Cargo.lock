@@ -258,6 +258,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
+name = "effects"
+version = "0.1.0"
+dependencies = [
+ "harness-core",
+ "harness-effects",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "email_address"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"

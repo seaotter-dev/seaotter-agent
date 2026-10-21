@@ -86,6 +86,7 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
     let bin = match name.as_str() {
         "examples/ticket-router" => "ticket-router",
         "examples/gated-generate" => "gated-generate",
+        "examples/effects" => "effects",
         other => return Err(format!("unknown workflow `{other}`")),
     };
     Ok((name.as_str(), bin, &args[2..]))
@@ -132,6 +133,17 @@ mod tests {
     fn missing_flag() {
         let err = parse(&[]).unwrap_err();
         assert!(err.contains("--workflow"), "{err}");
+    }
+
+    #[test]
+    fn effects_workflow() {
+        let args = args(&["--workflow", "examples/effects"]);
+        let Request::Workflow(workflow, bin, rest) = parse(&args).unwrap() else {
+            panic!("expected a workflow");
+        };
+        assert_eq!(workflow, "examples/effects");
+        assert_eq!(bin, "effects");
+        assert!(rest.is_empty());
     }
 
     #[test]
