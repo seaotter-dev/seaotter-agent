@@ -1,4 +1,4 @@
-# Code-owned agent harness: v1 spec
+# Code-owned agent harness
 
 This file is the source of truth for implementation. Changes to scope land here first.
 
@@ -92,3 +92,59 @@ Tracked in Linear under the "Code-owned agent harness" project.
    * SEA-357 Draft the arXiv paper
    * SEA-358 Measure tokens, latency, and branch stability against ReAct
    * SEA-359 Build the paper PDF and document regeneration
+
+## Goal (v2)
+
+The image is the local deployment unit. `docker build` and `docker run` are the iteration loop. The harness stays a library: code owns the next step, System One answers typed questions, and generative calls stay schema-bounded behind a gate.
+
+The issues listed under [v2 slices](#v2-slices) are the v2 work breakdown. Stay inside the non-goals.
+
+## Non-goals (v2)
+
+* A full agent loop where the model decides the next step
+* A multi-tenant control plane, queue, or fleet manager
+* A skill marketplace or model-written memory
+* Ambient credentials inside the container
+* A tool list the model can expand
+* Remote sandbox registration or production orchestration
+* A third-party integration layer such as Composio
+
+## Image requirements
+
+* Multi-stage build. The runtime stage is alpine with ca-certificates, or distroless if that image still runs the binary and is smaller.
+* Default user is not root.
+* Binaries live in `/usr/local/bin`.
+* `/data` is the writable path and is mounted from the host.
+* No secrets are copied into the image. Keys arrive through `-e` or an env file: `OPENAI_API_KEY`, `OPENAI_MODEL`, `ANTHROPIC_API_KEY`, and `TYPESAFE_API_KEY`. `USER_ID` is recorded and is not a credential.
+* ENTRYPOINT accepts `--workflow`.
+* A healthcheck confirms the binary starts and does not call a model.
+
+## v2 acceptance
+
+* `docker build -t seaotter-agent:dev .` succeeds, and `docker run` with `-v "$(pwd)/data:/data"` runs `examples/ticket-router`.
+* `gated-generate` has the same shape, including an offline fixture run that makes no network call.
+* The log on `/data` survives a new container that mounts the same directory.
+* Effects stay capability-scoped. The model receives no tool list.
+* A missing human-gate approval does not call the generative model.
+
+## v2 slices
+
+Tracked in Linear under the [Code-owned harness v2 — local Docker](https://linear.app/seaotter-dev/project/code-owned-harness-v2-local-docker-dc206a39c00f) project.
+
+1. Spec
+   * SEA-380 Land the v2 local-container spec in SPEC.md
+2. Image
+   * SEA-381 Add a multi-stage Dockerfile and .dockerignore
+   * SEA-382 Run the container as a non-root user
+3. Entrypoint
+   * SEA-383 Add a thin CLI with --workflow and use it as ENTRYPOINT
+   * SEA-384 Add a healthcheck that confirms the binary starts
+4. Local iteration
+   * SEA-386 Mount /data for the event log and workspace
+   * SEA-385 Run both examples from the container
+5. Effects and network
+   * SEA-387 Exercise FileRead, HttpGet, and shell inside the container
+   * SEA-389 Add a test-only destination restriction
+6. Log and human gate
+   * SEA-388 Persist each run on the volume and replay it
+   * SEA-390 Add a local human-gate node
