@@ -59,6 +59,8 @@ docker run --rm -v "$(pwd)/data:/data" --env-file .env \
   seaotter-agent:dev --workflow examples/gated-generate
 ```
 
+`gated-generate` drafts when `/data/approval` exists or `APPROVAL_TOKEN` is set, and a missing approval does not call the generative model.
+
 `examples/effects` runs `FileRead`, allowlisted `HttpGet`, and the shell inside the container. `FileRead` is rooted at `/data/workspace`. The shell stays off unless that binary grants it in Rust, and its argument vector is fixed there. No model is called. `HTTP_DESTINATIONS` narrows this example's hosts and is not a credential.
 
 ```sh

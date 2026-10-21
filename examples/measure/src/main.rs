@@ -62,7 +62,15 @@ async fn execute() -> Result<(), HarnessError> {
     for index in 1..=repeats {
         eprintln!("gated-generate harness {index}/{repeats}");
         gated_harness.push(record_from_run(
-            &gated_generate::run(&gated, Some(LiveClient::OpenAi)).await?,
+            &gated_generate::run(
+                &gated,
+                Some(LiveClient::OpenAi),
+                &gated_generate::Approval {
+                    path: std::path::PathBuf::new(),
+                    token_present: true,
+                },
+            )
+            .await?,
         )?);
         eprintln!("gated-generate ReAct {index}/{repeats}");
         gated_react.push(
