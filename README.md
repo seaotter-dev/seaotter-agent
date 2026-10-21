@@ -22,3 +22,9 @@ v1 is not a general agent framework. It has no skill marketplace, no model-owned
 cargo build --workspace
 cargo test --workspace
 ```
+
+## Container
+
+`docker build -t seaotter-agent:dev .` produces an image that runs as `seaotter` (uid 10001), not root. `/data` is the writable path and is meant to be a host mount.
+
+No local effect needs root. `FileRead` and `HttpGet` run as that user. `DangerousShell` stays off unless Rust grants it. The command is fixed when the effect is built, and it runs without a shell.
