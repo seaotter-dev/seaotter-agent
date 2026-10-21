@@ -21,3 +21,5 @@ RUN addgroup -g 10001 -S seaotter \
     && chown 10001:10001 /data
 USER seaotter
 ENTRYPOINT ["/usr/local/bin/seaotter-agent"]
+HEALTHCHECK --interval=5s --timeout=3s --retries=3 \
+    CMD ["/usr/local/bin/seaotter-agent", "--health"]
