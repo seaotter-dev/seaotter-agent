@@ -2,7 +2,7 @@ use std::env;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use gated_generate::{LiveClient, load_fixture, report, run};
+use gated_generate::{Approval, LiveClient, load_fixture, report, run, token_is_present};
 use harness_core::{HarnessError, append_run};
 
 #[tokio::main]
@@ -24,7 +24,11 @@ async fn execute() -> Result<String, HarnessError> {
     let json = std::fs::read_to_string(&path)
         .map_err(|err| HarnessError::Workflow(format!("reading {}: {err}", path.display())))?;
     let fixture = load_fixture(&json)?;
-    let finished = run(&fixture, live).await?;
+    let approval = Approval {
+        path: PathBuf::from("/data/approval"),
+        token_present: token_is_present(env::var("APPROVAL_TOKEN").ok().as_deref()),
+    };
+    let finished = run(&fixture, live, &approval).await?;
     let user_id = env::var("USER_ID").unwrap_or_default();
     let id = append_run(
         std::path::Path::new("/data/log"),

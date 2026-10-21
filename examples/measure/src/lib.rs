@@ -578,7 +578,16 @@ mod tests {
         let gated =
             gated_generate::load_fixture(include_str!("../../gated-generate/fixtures/allow.json"))
                 .unwrap();
-        let gated_run = gated_generate::run(&gated, None).await.unwrap();
+        let gated_run = gated_generate::run(
+            &gated,
+            None,
+            &gated_generate::Approval {
+                path: std::path::PathBuf::new(),
+                token_present: true,
+            },
+        )
+        .await
+        .unwrap();
         let gated_record = record_from_run(&gated_run).unwrap();
         assert_eq!(gated_record.branch, "drafted");
         assert_eq!(gated_record.latency_ms, 410);

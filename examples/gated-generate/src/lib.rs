@@ -6,6 +6,7 @@
 //! OpenAI-compatible and Anthropic does not change the graph.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 use harness_core::{
     Answer, BoxFuture, ConfidenceAction, ConfidencePolicy, DecisionModel, DecisionRequest,
@@ -19,6 +20,18 @@ use harness_providers::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+
+/// Local approval for the `approve` node. The token value is not stored.
+#[derive(Debug, Clone)]
+pub struct Approval {
+    pub path: PathBuf,
+    pub token_present: bool,
+}
+
+/// `true` when `value` is set and not only whitespace.
+pub fn token_is_present(value: Option<&str>) -> bool {
+    value.is_some_and(|value| !value.trim().is_empty())
+}
 
 /// Which live generative client to use. The workflow graph stays the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +77,10 @@ pub fn workflow() -> Result<Workflow, HarnessError> {
                     on_low: ConfidenceAction::SafeDefault,
                 },
             },
+            Node::Deterministic {
+                id: "approve".into(),
+                step: approve,
+            },
             Node::Generate {
                 id: "draft".into(),
                 task: "Draft a short reply to this support request.".into(),
@@ -91,11 +108,24 @@ pub fn workflow() -> Result<Workflow, HarnessError> {
 }
 
 /// Runs `fixture`. `live` calls TypeSafe for the gate and the named generative
-/// client, and ignores the recorded answer and draft.
-pub async fn run(fixture: &Fixture, live: Option<LiveClient>) -> Result<Run, HarnessError> {
+/// client, and ignores the recorded answer and draft. `approval` is the local
+/// file and token flag. A missing approval does not visit `draft`.
+pub async fn run(
+    fixture: &Fixture,
+    live: Option<LiveClient>,
+    approval: &Approval,
+) -> Result<Run, HarnessError> {
     let wf = workflow()?;
     let mut state = State::new();
     state.insert("request".into(), json!(fixture.request));
+    state.insert(
+        "approval_path".into(),
+        json!(approval.path.to_string_lossy()),
+    );
+    state.insert(
+        "approval_token_present".into(),
+        json!(approval.token_present),
+    );
     let machine = match live {
         None => Machine::builder()
             .decision(FixtureDecision {
@@ -191,6 +221,20 @@ fn normalize(state: &mut State) -> Result<(), HarnessError> {
     Ok(())
 }
 
+fn approve(state: &mut State) -> Result<(), HarnessError> {
+    let path = state
+        .get("approval_path")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let file = !path.is_empty() && Path::new(path).is_file();
+    let token = state
+        .get("approval_token_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    state.insert("approved".into(), json!(file || token));
+    Ok(())
+}
+
 fn to_drafted(state: &mut State) -> Result<(), HarnessError> {
     state.insert("destination".into(), json!("drafted"));
     Ok(())
@@ -201,13 +245,20 @@ fn to_safe(state: &mut State) -> Result<(), HarnessError> {
     Ok(())
 }
 
-/// A confident gate always continues to `draft`. The gate on that node skips
-/// the model unless the top label is `true`. Low confidence never reaches
-/// this match: the machine sends it to `safe`.
-fn transition(node: &NodeId, outcome: &Outcome, _: &State) -> Next {
+/// A confident gate continues to `approve`. Approval continues to `draft`.
+/// The gate on `draft` skips the model unless the top label is `true`. Low
+/// confidence never reaches this match: the machine sends it to `safe`.
+fn transition(node: &NodeId, outcome: &Outcome, state: &State) -> Next {
     match (node.0.as_str(), outcome) {
         ("normalize", _) => Next::Goto("gate".into()),
-        ("gate", Outcome::Decided(_)) => Next::Goto("draft".into()),
+        ("gate", Outcome::Decided(_)) => Next::Goto("approve".into()),
+        ("approve", _) => {
+            if state.get("approved").and_then(Value::as_bool) == Some(true) {
+                Next::Goto("draft".into())
+            } else {
+                Next::Goto("safe".into())
+            }
+        }
         ("draft", Outcome::Generated(_)) => Next::Goto("accept".into()),
         ("draft", Outcome::Skipped) => Next::Goto("safe".into()),
         _ => Next::End,
