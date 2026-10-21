@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 use harness_core::{
     Answer, BoxFuture, ConfidenceAction, ConfidencePolicy, DecisionModel, DecisionRequest,
-    DecisionResponse, EventKind, HarnessError, Machine, Next, Node, NodeId, Outcome, Question, Run,
-    State, Usage, Workflow,
+    DecisionResponse, Event, EventKind, HarnessError, Machine, Next, Node, NodeId, Outcome,
+    Question, Run, State, Usage, Workflow,
 };
 use harness_providers::{TypeSafeConfig, TypeSafeDecision};
 use serde::Deserialize;
@@ -107,6 +107,20 @@ pub async fn run(fixture: &Fixture, live: bool) -> Result<Run, HarnessError> {
     machine.run(&wf, state).await
 }
 
+/// Replays `events` from the same fixture state. The decision model fails if
+/// the recorded decide step does not cover the call.
+pub async fn replay(fixture: &Fixture, events: &[Event]) -> Result<Run, HarnessError> {
+    let wf = workflow()?;
+    let mut state = State::new();
+    state.insert("subject".into(), json!(fixture.ticket.subject));
+    state.insert("body".into(), json!(fixture.ticket.body));
+    Machine::builder()
+        .decision(RefuseModel)
+        .build()
+        .replay(&wf, state, events)
+        .await
+}
+
 /// Destination, chosen label, confidence, latency, and cost from a finished run.
 pub fn report(run: &Run) -> String {
     let destination = run
@@ -202,6 +216,21 @@ fn transition(node: &NodeId, outcome: &Outcome, _: &State) -> Next {
             Next::Goto(next.into())
         }
         _ => Next::End,
+    }
+}
+
+struct RefuseModel;
+
+impl DecisionModel for RefuseModel {
+    fn evaluate(
+        &self,
+        _req: DecisionRequest,
+    ) -> BoxFuture<'_, Result<DecisionResponse, HarnessError>> {
+        Box::pin(async {
+            Err(HarnessError::Workflow(
+                "replay called the decision model".into(),
+            ))
+        })
     }
 }
 

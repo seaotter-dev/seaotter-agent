@@ -182,6 +182,7 @@ fn types_roundtrip_through_json() {
     }
     roundtrip(&Event {
         node: "route".into(),
+        name: "route".into(),
         kind: EventKind::Decide,
         input_hash: "abc123".into(),
         output: json!({"route": "billing"}),

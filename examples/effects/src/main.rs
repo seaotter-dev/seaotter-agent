@@ -7,7 +7,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use harness_core::{
-    Capability, Effect, HarnessError, Machine, Next, Node, NodeId, Outcome, State, Workflow,
+    Capability, Effect, Event, HarnessError, Machine, Next, Node, NodeId, Outcome, State, Workflow,
+    append_run,
 };
 use harness_effects::{FileRead, HttpGet, Shell};
 use serde_json::json;
@@ -36,15 +37,27 @@ async fn exercise() -> Result<String, String> {
     let note = workspace.join("note.txt");
     std::fs::write(&note, NOTE).map_err(|err| format!("writing {}: {err}", note.display()))?;
 
-    let read = read_note(workspace).await?;
+    let (read, read_events) = read_note(workspace).await?;
     let escaped = escape_rejected(workspace).await?;
     let http = http_rejected().await?;
     let denied = shell_denied(workspace).await?;
-    let granted = shell_granted().await?;
-    Ok(format!("{read}\n{escaped}\n{http}\n{denied}\n{granted}"))
+    let (granted, shell_events) = shell_granted().await?;
+    let mut events = read_events;
+    events.extend(shell_events);
+    let user_id = std::env::var("USER_ID").unwrap_or_default();
+    let id = append_run(
+        Path::new("/data/log"),
+        "examples/effects",
+        &user_id,
+        &events,
+    )
+    .map_err(|err| err.to_string())?;
+    Ok(format!(
+        "{read}\n{escaped}\n{http}\n{denied}\n{granted}\nrun_id: {id}"
+    ))
 }
 
-async fn read_note(root: &Path) -> Result<String, String> {
+async fn read_note(root: &Path) -> Result<(String, Vec<Event>), String> {
     let run = machine(
         FileRead::new(root).map_err(show)?,
         Some(Capability::FileRead),
@@ -62,7 +75,10 @@ async fn read_note(root: &Path) -> Result<String, String> {
     if contents != NOTE {
         return Err(format!("file_read returned {contents:?}"));
     }
-    Ok(format!("file_read: {contents}"))
+    Ok((
+        format!("file_read: {contents}"),
+        run.events.as_slice().to_vec(),
+    ))
 }
 
 async fn escape_rejected(root: &Path) -> Result<String, String> {
@@ -112,7 +128,7 @@ async fn shell_denied(root: &Path) -> Result<String, String> {
     expect_contains(&err, "capability denied: DangerousShell")
 }
 
-async fn shell_granted() -> Result<String, String> {
+async fn shell_granted() -> Result<(String, Vec<Event>), String> {
     let run = machine(
         Shell::new("/bin/echo", ["fixed"]).map_err(show)?,
         Some(Capability::DangerousShell),
@@ -127,7 +143,7 @@ async fn shell_granted() -> Result<String, String> {
     if stdout != "fixed\n" {
         return Err(format!("shell stdout was {stdout:?}"));
     }
-    Ok("shell: fixed".into())
+    Ok(("shell: fixed".into(), run.events.as_slice().to_vec()))
 }
 
 fn machine(effect: impl Effect + 'static, grant: Option<Capability>) -> Machine {
