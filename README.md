@@ -28,3 +28,23 @@ cargo test --workspace
 `docker build -t seaotter-agent:dev .` produces an image that runs as `seaotter` (uid 10001), not root. `/data` is the writable path and is meant to be a host mount.
 
 No local effect needs root. `FileRead` and `HttpGet` run as that user. `DangerousShell` stays off unless Rust grants it. The command is fixed when the effect is built, and it runs without a shell.
+
+Edit a workflow, build the image, and run it offline. A bare run uses the fixtures baked into the image and does not call a model.
+
+```sh
+docker build -t seaotter-agent:dev .
+docker run --rm seaotter-agent:dev --workflow examples/ticket-router
+docker run --rm seaotter-agent:dev --workflow examples/gated-generate
+```
+
+A change to one example can reuse that image. Rebuild the binary with the Alpine musl toolchain and bind-mount it over `/usr/local/bin/ticket-router`:
+
+```sh
+docker run --rm -v "$(pwd)":/src -w /src -e CARGO_TARGET_DIR=/src/target/docker rust:1-alpine \
+  sh -c "apk add --no-cache musl-dev && cargo build --locked --release -p ticket-router"
+docker run --rm \
+  -v "$(pwd)/target/docker/release/ticket-router:/usr/local/bin/ticket-router" \
+  seaotter-agent:dev --workflow examples/ticket-router
+```
+
+`gated-generate` is the same shape with `-p gated-generate` and `target/docker/release/gated-generate`.
