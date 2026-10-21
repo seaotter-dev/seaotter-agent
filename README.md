@@ -48,3 +48,13 @@ docker run --rm \
 ```
 
 `gated-generate` is the same shape with `-p gated-generate` and `target/docker/release/gated-generate`.
+
+Mount a host directory at `/data`. `/data/log` and `/data/workspace` stay on that directory for the next container. Keys arrive through `-e` or an env file: `OPENAI_API_KEY`, `OPENAI_MODEL`, `ANTHROPIC_API_KEY`, and `TYPESAFE_API_KEY`. `USER_ID` is recorded in `/data/log` and is not a credential.
+
+```sh
+docker run --rm -v "$(pwd)/data:/data" \
+  -e OPENAI_API_KEY -e OPENAI_MODEL -e ANTHROPIC_API_KEY -e TYPESAFE_API_KEY -e USER_ID \
+  seaotter-agent:dev --workflow examples/ticket-router
+docker run --rm -v "$(pwd)/data:/data" --env-file .env \
+  seaotter-agent:dev --workflow examples/gated-generate
+```
