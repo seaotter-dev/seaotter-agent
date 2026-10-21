@@ -1,0 +1,8 @@
+[package]
+name = "seaotter-agent"
+description = "Thin CLI that dispatches a named example workflow."
+publish = false
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
