@@ -1,10 +1,9 @@
-use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (workflow, bin, rest) = match parse(&args) {
+    let (_workflow, bin, rest) = match parse(&args) {
         Ok(Request::Health) => return ExitCode::SUCCESS,
         Ok(Request::Workflow(workflow, bin, rest)) => (workflow, bin, rest),
         Err(err) => {
@@ -19,12 +18,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if code == 0 {
-        let user_id = std::env::var("USER_ID").unwrap_or_default();
-        if let Err(err) = record_run(Path::new("/data"), workflow, &user_id) {
-            eprintln!("{err}");
-            return ExitCode::FAILURE;
-        }
+    if code == 0
+        && let Err(err) = ensure_workspace(Path::new("/data"))
+    {
+        eprintln!("{err}");
+        return ExitCode::FAILURE;
     }
     ExitCode::from(code)
 }
@@ -43,39 +41,10 @@ fn parse(args: &[String]) -> Result<Request<'_>, String> {
     Ok(Request::Workflow(workflow, bin, rest))
 }
 
-fn record_run(root: &Path, workflow: &str, user_id: &str) -> Result<(), String> {
+fn ensure_workspace(root: &Path) -> Result<(), String> {
     let workspace = root.join("workspace");
     std::fs::create_dir_all(&workspace)
-        .map_err(|err| format!("creating {}: {err}", workspace.display()))?;
-    let line = format!(
-        "{{\"workflow\":{},\"user_id\":{}}}\n",
-        json_string(workflow),
-        json_string(user_id)
-    );
-    let path = root.join("log");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|err| format!("opening {}: {err}", path.display()))?;
-    file.write_all(line.as_bytes())
-        .map_err(|err| format!("writing {}: {err}", path.display()))
-}
-
-fn json_string(value: &str) -> String {
-    let mut out = String::from("\"");
-    for c in value.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04x}", u32::from(c))),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+        .map_err(|err| format!("creating {}: {err}", workspace.display()))
 }
 
 fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), String> {
@@ -94,7 +63,7 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, parse, record_run};
+    use super::{Request, ensure_workspace, parse};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(str::to_string).collect()
@@ -153,24 +122,12 @@ mod tests {
     }
 
     #[test]
-    fn record_appends_user_id_and_omits_secrets() {
+    fn workspace_is_created_without_a_log() {
         let root = std::env::temp_dir().join(format!("seaotter-record-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        record_run(&root, "examples/ticket-router", "user-7").unwrap();
-        record_run(&root, "examples/gated-generate", "user\"7").unwrap();
-        let log = std::fs::read_to_string(root.join("log")).unwrap();
-        assert!(!log.contains("sk-test"), "{log}");
-        let mut lines = log.lines();
-        assert_eq!(
-            lines.next().unwrap(),
-            r#"{"workflow":"examples/ticket-router","user_id":"user-7"}"#
-        );
-        assert_eq!(
-            lines.next().unwrap(),
-            r#"{"workflow":"examples/gated-generate","user_id":"user\"7"}"#
-        );
-        assert!(lines.next().is_none());
+        ensure_workspace(&root).unwrap();
         assert!(root.join("workspace").is_dir());
+        assert!(!root.join("log").exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

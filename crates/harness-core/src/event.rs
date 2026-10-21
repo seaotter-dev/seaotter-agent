@@ -1,3 +1,8 @@
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -26,6 +31,9 @@ pub struct Usage {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub node: NodeId,
+    /// Node id for a decide or generate step. The effect's registered name
+    /// for an effect step.
+    pub name: String,
     pub kind: EventKind,
     pub input_hash: String,
     pub output: Value,
@@ -74,4 +82,133 @@ pub fn input_hash(value: &impl Serialize) -> Result<String, HarnessError> {
         out.push_str(&format!("{byte:02x}"));
     }
     Ok(out)
+}
+
+static NEXT_RUN: AtomicU64 = AtomicU64::new(0);
+
+fn new_run_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let n = NEXT_RUN.fetch_add(1, Ordering::Relaxed);
+    format!("{nanos:x}-{n}-{}", std::process::id())
+}
+
+#[derive(Serialize)]
+struct RunHeader<'a> {
+    run_id: &'a str,
+    workflow: &'a str,
+    user_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct RunStep<'a> {
+    run_id: &'a str,
+    kind: EventKind,
+    name: &'a str,
+    node: &'a NodeId,
+    input_hash: &'a str,
+    outcome: &'a Value,
+    confidence: Option<f64>,
+    usage: &'a Usage,
+}
+
+#[derive(Deserialize)]
+struct StoredStep {
+    kind: EventKind,
+    name: String,
+    node: NodeId,
+    input_hash: String,
+    outcome: Value,
+    confidence: Option<f64>,
+    usage: Usage,
+}
+
+/// Appends one run to `path` as JSON lines. The first line is the header.
+/// Each later line is one decide, generate, or effect step. The write is a
+/// single append. This function does not read provider keys.
+pub fn append_run(
+    path: &Path,
+    workflow: &str,
+    user_id: &str,
+    events: &[Event],
+) -> Result<String, HarnessError> {
+    let run_id = new_run_id();
+    let mut body = json_line(&RunHeader {
+        run_id: &run_id,
+        workflow,
+        user_id,
+    })?;
+    for event in events {
+        body.push_str(&json_line(&RunStep {
+            run_id: &run_id,
+            kind: event.kind,
+            name: &event.name,
+            node: &event.node,
+            input_hash: &event.input_hash,
+            outcome: &event.output,
+            confidence: event.confidence,
+            usage: &event.usage,
+        })?);
+    }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|err| {
+            HarnessError::Workflow(format!("creating {}: {err}", parent.display()))
+        })?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|err| HarnessError::Workflow(format!("opening {}: {err}", path.display())))?;
+    file.write_all(body.as_bytes())
+        .map_err(|err| HarnessError::Workflow(format!("writing {}: {err}", path.display())))?;
+    Ok(run_id)
+}
+
+/// Events for `run_id`. Lines from other runs are ignored.
+pub fn read_run(path: &Path, run_id: &str) -> Result<Vec<Event>, HarnessError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| HarnessError::Workflow(format!("reading {}: {err}", path.display())))?;
+    let mut seen = false;
+    let mut events = Vec::new();
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)
+            .map_err(|err| HarnessError::Workflow(format!("run log: {err}")))?;
+        if value.get("run_id").and_then(Value::as_str) != Some(run_id) {
+            continue;
+        }
+        seen = true;
+        if value.get("kind").is_none() {
+            continue;
+        }
+        let step: StoredStep = serde_json::from_value(value)
+            .map_err(|err| HarnessError::Workflow(format!("run log step: {err}")))?;
+        events.push(Event {
+            node: step.node,
+            name: step.name,
+            kind: step.kind,
+            input_hash: step.input_hash,
+            output: step.outcome,
+            confidence: step.confidence,
+            usage: step.usage,
+        });
+    }
+    if !seen {
+        return Err(HarnessError::Workflow(format!("unknown run `{run_id}`")));
+    }
+    Ok(events)
+}
+
+fn json_line(value: &impl Serialize) -> Result<String, HarnessError> {
+    let mut line = serde_json::to_string(value)
+        .map_err(|err| HarnessError::Workflow(format!("run log: {err}")))?;
+    line.push('\n');
+    Ok(line)
 }

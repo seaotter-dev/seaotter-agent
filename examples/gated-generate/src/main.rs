@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use gated_generate::{LiveClient, load_fixture, report, run};
-use harness_core::HarnessError;
+use harness_core::{HarnessError, append_run};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -25,7 +25,14 @@ async fn execute() -> Result<String, HarnessError> {
         .map_err(|err| HarnessError::Workflow(format!("reading {}: {err}", path.display())))?;
     let fixture = load_fixture(&json)?;
     let finished = run(&fixture, live).await?;
-    Ok(report(&finished))
+    let user_id = env::var("USER_ID").unwrap_or_default();
+    let id = append_run(
+        std::path::Path::new("/data/log"),
+        "examples/gated-generate",
+        &user_id,
+        finished.events.as_slice(),
+    )?;
+    Ok(format!("{}\nrun_id: {id}", report(&finished)))
 }
 
 fn parse_args() -> Result<(Option<LiveClient>, PathBuf), HarnessError> {

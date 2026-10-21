@@ -41,7 +41,7 @@ pub use diff::{Divergence, diff_runs};
 pub use effect::{Capability, Effect};
 pub use error::HarnessError;
 pub use eval::{FixtureError, check_answer_fixture, check_branch_fixture};
-pub use event::{Event, EventKind, EventLog, Usage, input_hash};
+pub use event::{Event, EventKind, EventLog, Usage, append_run, input_hash, read_run};
 pub use future::BoxFuture;
 pub use generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, JsonSchema, OutputSpec};
 pub use machine::{Machine, MachineBuilder, Run, RunStatus};

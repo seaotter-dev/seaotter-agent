@@ -272,6 +272,7 @@ impl Machine {
                 validate_output(output, &resp.output)?;
                 events.push(Event {
                     node: id.clone(),
+                    name: id.0.clone(),
                     kind: EventKind::Generate,
                     input_hash: hash,
                     output: stored_gen(&resp.output),
@@ -309,6 +310,7 @@ impl Machine {
                     };
                 events.push(Event {
                     node: id.clone(),
+                    name: name.clone(),
                     kind: EventKind::Effect,
                     input_hash: hashed,
                     output: output.clone(),
@@ -441,6 +443,7 @@ fn record_decide(
         serde_json::to_value(&resp.answers).map_err(|e| HarnessError::Provider(e.to_string()))?;
     events.push(Event {
         node: node.clone(),
+        name: node.0.clone(),
         kind: EventKind::Decide,
         input_hash: input_hash(req)?,
         output,
