@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use harness_core::{
     BranchWhen, Catalog, ConfidenceAction, ConfidencePolicy, DocumentNode, Gate, HarnessError,
-    JsonSchema, OutputSpec, Question, RiskTier,
+    JsonSchema, OutputSpec, Question, RiskTier, apply_reply,
 };
 use serde_json::json;
 
@@ -56,8 +56,12 @@ fn a_catalog_builds_a_document_from_the_allowed_operations() {
     catalog
         .set_low(ConfidenceAction::SafeDefault, "queue")
         .unwrap();
-    catalog.add_effect("read", "file_read", vec![]).unwrap();
-    catalog.add_effect("fetch", "http_get", vec![]).unwrap();
+    catalog
+        .add_effect("read", "file_read", vec![], None, None)
+        .unwrap();
+    catalog
+        .add_effect("fetch", "http_get", vec![], None, None)
+        .unwrap();
 
     let doc = catalog.document().unwrap();
     let again = serde_json::from_str(&serde_json::to_string(&doc).unwrap()).unwrap();
@@ -96,9 +100,11 @@ fn an_unknown_effect_leaves_the_catalog_unchanged() {
     catalog
         .add_decide("classify", vec![], decide_questions(), policy())
         .unwrap();
-    for name in ["shell", "dangerous", "composio"] {
+    for name in ["shell", "dangerous"] {
         let before = catalog.clone();
-        let err = catalog.add_effect("run", name, vec![]).unwrap_err();
+        let err = catalog
+            .add_effect("run", name, vec![], None, None)
+            .unwrap_err();
         assert_eq!(
             err,
             HarnessError::Workflow(format!("unknown effect `{name}`"))
@@ -111,7 +117,9 @@ fn an_unknown_effect_leaves_the_catalog_unchanged() {
 fn a_known_effect_without_a_grant_leaves_the_catalog_unchanged() {
     let mut catalog = Catalog::new("fixture", RiskTier::Read, Vec::<String>::new()).unwrap();
     let before = catalog.clone();
-    let err = catalog.add_effect("read", "file_read", vec![]).unwrap_err();
+    let err = catalog
+        .add_effect("read", "file_read", vec![], None, None)
+        .unwrap_err();
     assert_eq!(
         err,
         HarnessError::Workflow("effect `file_read` has no grant".into())
@@ -154,6 +162,58 @@ fn a_bad_gate_or_low_edge_leaves_the_catalog_unchanged() {
     assert_eq!(
         low,
         HarnessError::Workflow("Continue is not a low-confidence edge".into())
+    );
+    assert_eq!(catalog, before);
+}
+
+#[test]
+fn a_granted_composio_reply_stores_the_connection_and_action() {
+    let doc = apply_reply(
+        "fixture",
+        RiskTier::Read,
+        ["GMAIL_SEND_EMAIL"],
+        r#"[
+          {
+            "op": "add_effect",
+            "id": "send",
+            "name": "composio",
+            "reads": ["draft"],
+            "connection": "conn_123",
+            "action": "GMAIL_SEND_EMAIL"
+          }
+        ]"#,
+    )
+    .unwrap();
+    let text = serde_json::to_string(&doc).unwrap();
+    assert!(text.contains("\"connection\":\"conn_123\""), "{text}");
+    assert!(text.contains("\"action\":\"GMAIL_SEND_EMAIL\""), "{text}");
+    assert!(!text.contains("COMPOSIO_API_KEY"), "{text}");
+}
+
+#[test]
+fn a_composio_action_outside_the_grant_leaves_the_catalog_unchanged() {
+    let mut catalog = Catalog::new("fixture", RiskTier::Read, ["GMAIL_SEND_EMAIL"]).unwrap();
+    let before = catalog.clone();
+    let missing = catalog
+        .add_effect("send", "composio", vec![], Some("conn_123".into()), None)
+        .unwrap_err();
+    assert_eq!(
+        missing,
+        HarnessError::Workflow("effect `composio` has no action".into())
+    );
+    assert_eq!(catalog, before);
+    let outside = catalog
+        .add_effect(
+            "send",
+            "composio",
+            vec![],
+            Some("conn_123".into()),
+            Some("GMAIL_DELETE_EMAIL".into()),
+        )
+        .unwrap_err();
+    assert_eq!(
+        outside,
+        HarnessError::Workflow("effect `composio` action `GMAIL_DELETE_EMAIL` has no grant".into())
     );
     assert_eq!(catalog, before);
 }

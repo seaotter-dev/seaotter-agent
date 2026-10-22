@@ -154,6 +154,8 @@ fn workflow() -> Workflow {
         id: "run".into(),
         name: "shell".into(),
         reads: vec!["command".into()],
+        connection: None,
+        action: None,
     }];
     Workflow::new("run".into(), nodes, transition).unwrap()
 }
