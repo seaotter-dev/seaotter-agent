@@ -309,6 +309,8 @@ fn workflow() -> Workflow {
         id: "fetch".into(),
         name: "http_get".into(),
         reads: vec!["url".into()],
+        connection: None,
+        action: None,
     }];
     Workflow::new("fetch".into(), nodes, transition).unwrap()
 }

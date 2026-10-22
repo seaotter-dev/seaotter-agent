@@ -12,11 +12,14 @@
 //! - [`Shell`]: runs one fixed argv with an empty environment
 //!   ([`Capability::DangerousShell`](harness_core::Capability::DangerousShell)).
 //!   Never registered or granted by default.
+//! - [`Composio`]: runs one granted action. The key stays in the environment.
 
+mod composio;
 mod file_read;
 mod http_get;
 mod shell;
 
+pub use composio::{Composio, ExecuteCall};
 pub use file_read::FileRead;
 pub use http_get::HttpGet;
 pub use shell::Shell;

@@ -205,6 +205,8 @@ fn workflow(id: &str, effect: &str, reads: &[&str]) -> Result<Workflow, HarnessE
             id: id.into(),
             name: effect.into(),
             reads: reads.iter().map(|key| (*key).to_owned()).collect(),
+            connection: None,
+            action: None,
         }],
         end,
     )

@@ -339,7 +339,31 @@ impl Machine {
         if doc.owner.trim().is_empty() {
             return Err(HarnessError::Workflow("document has no owner".into()));
         }
-        if !doc.grants.contains(name) {
+        let action_granted = match node {
+            Node::Effect {
+                name: effect_name,
+                action,
+                ..
+            } if effect_name == "composio" => {
+                let Some(action) = action
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                else {
+                    return Err(HarnessError::Workflow(
+                        "effect `composio` has no action".into(),
+                    ));
+                };
+                if !doc.grants.contains(action) {
+                    return Err(HarnessError::Workflow(format!(
+                        "effect `composio` action `{action}` has no grant"
+                    )));
+                }
+                true
+            }
+            _ => false,
+        };
+        if !action_granted && !doc.grants.contains(name) {
             return Err(HarnessError::Workflow(format!(
                 "effect `{name}` has no grant"
             )));
@@ -447,7 +471,13 @@ impl Machine {
                 });
                 Outcome::Generated(resp.output)
             }
-            Node::Effect { id, name, reads } => {
+            Node::Effect {
+                id,
+                name,
+                reads,
+                connection,
+                action,
+            } => {
                 let effect = self
                     .effects
                     .get(name)
@@ -456,7 +486,14 @@ impl Machine {
                 if !self.granted.contains(&capability) {
                     return Err(HarnessError::CapabilityDenied(capability));
                 }
-                let input = Value::Object(slice(state, reads).into_iter().collect());
+                let mut input_map = slice(state, reads);
+                if let Some(connection) = connection {
+                    input_map.insert("connection".to_owned(), Value::String(connection.clone()));
+                }
+                if let Some(action) = action {
+                    input_map.insert("action".to_owned(), Value::String(action.clone()));
+                }
+                let input = Value::Object(input_map.into_iter().collect());
                 let hashed = input_hash(&input)?;
                 let (output, usage) =
                     if let Some(event) = trace.take(id, EventKind::Effect, &hashed) {
@@ -712,10 +749,18 @@ fn node_from_document(node: &DocumentNode) -> Node {
             max_tokens: *max_tokens,
             gate: gate.clone(),
         },
-        DocumentNode::Effect { id, name, reads } => Node::Effect {
+        DocumentNode::Effect {
+            id,
+            name,
+            reads,
+            connection,
+            action,
+        } => Node::Effect {
             id: id.clone(),
             name: name.clone(),
             reads: reads.clone(),
+            connection: connection.clone(),
+            action: action.clone(),
         },
     }
 }

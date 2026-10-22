@@ -146,6 +146,8 @@ fn mixed(on_low: ConfidenceAction, gate: bool) -> Workflow {
             id: "fetch".into(),
             name: "echo".into(),
             reads: vec!["subject".into()],
+            connection: None,
+            action: None,
         },
     ];
     Workflow::new(
@@ -358,6 +360,8 @@ async fn denied_effect_returns_the_error_without_a_run() {
         id: "fetch".into(),
         name: "echo".into(),
         reads: vec!["subject".into()],
+        connection: None,
+        action: None,
     }];
     let workflow = Workflow::new("fetch".into(), nodes, |_, _, _| Next::End).unwrap();
     let err = machine.run(&workflow, ticket()).await.unwrap_err();

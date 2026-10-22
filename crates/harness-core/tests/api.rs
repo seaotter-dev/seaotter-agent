@@ -229,6 +229,8 @@ fn nodes_cover_every_variant() {
             id: "fetch".into(),
             name: "upper".into(),
             reads: vec!["subject".into()],
+            connection: None,
+            action: None,
         },
     ];
     assert_eq!(nodes.len(), 4);

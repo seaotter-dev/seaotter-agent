@@ -144,6 +144,8 @@ fn workflow(on_low: ConfidenceAction) -> Workflow {
             id: "fetch".into(),
             name: "echo".into(),
             reads: vec!["subject".into()],
+            connection: None,
+            action: None,
         },
         Node::Deterministic {
             id: "escalate".into(),

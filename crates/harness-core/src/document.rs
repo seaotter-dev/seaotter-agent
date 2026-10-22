@@ -81,6 +81,10 @@ pub enum DocumentNode {
         id: NodeId,
         name: String,
         reads: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        connection: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        action: Option<String>,
     },
 }
 
@@ -144,16 +148,37 @@ impl WorkflowDocument {
         }
         let grants: BTreeSet<String> = grants.into_iter().map(Into::into).collect();
         for node in &nodes {
-            if let DocumentNode::Effect { name, .. } = node {
+            if let DocumentNode::Effect {
+                name,
+                connection,
+                action,
+                ..
+            } = node
+            {
                 if name == "shell" || name == "dangerous" {
                     return Err(HarnessError::Workflow(format!(
                         "effect `{name}` cannot be loaded"
                     )));
                 }
-                if !grants.contains(name) {
-                    return Err(HarnessError::Workflow(format!(
-                        "effect `{name}` has no grant"
-                    )));
+                if name == "composio" {
+                    let action = required_text(action, "effect `composio` has no action")?;
+                    required_text(connection, "effect `composio` has no connection")?;
+                    if !grants.contains(action) {
+                        return Err(HarnessError::Workflow(format!(
+                            "effect `composio` action `{action}` has no grant"
+                        )));
+                    }
+                } else {
+                    if connection.is_some() || action.is_some() {
+                        return Err(HarnessError::Workflow(format!(
+                            "effect `{name}` does not take a connection"
+                        )));
+                    }
+                    if !grants.contains(name) {
+                        return Err(HarnessError::Workflow(format!(
+                            "effect `{name}` has no grant"
+                        )));
+                    }
                 }
             }
         }
@@ -233,6 +258,17 @@ impl WorkflowDocument {
         }
         self.human_gate = Some(gate);
         Ok(self)
+    }
+}
+
+fn required_text<'a>(value: &'a Option<String>, missing: &str) -> Result<&'a str, HarnessError> {
+    match value
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        Some(text) => Ok(text),
+        None => Err(HarnessError::Workflow(missing.into())),
     }
 }
 

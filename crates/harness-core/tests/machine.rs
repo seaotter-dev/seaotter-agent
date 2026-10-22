@@ -296,6 +296,8 @@ fn effect_workflow() -> Workflow {
         id: "fetch".into(),
         name: "echo".into(),
         reads: vec!["subject".into()],
+        connection: None,
+        action: None,
     }];
     Workflow::new("fetch".into(), nodes, |_, _, _| Next::End).unwrap()
 }

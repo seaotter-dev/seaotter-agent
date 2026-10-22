@@ -173,6 +173,8 @@ fn effect_edge_round_trips() {
             id: "read".into(),
             name: "file_read".into(),
             reads: vec!["path".into()],
+            connection: None,
+            action: None,
         }],
         vec![BranchEdge {
             from: "read".into(),
@@ -350,6 +352,8 @@ fn shell_and_dangerous_effects_fail_even_with_a_grant() {
                 id: "run".into(),
                 name: name.into(),
                 reads: vec![],
+                connection: None,
+                action: None,
             }],
             vec![],
             BTreeMap::new(),
@@ -374,6 +378,8 @@ fn an_effect_requires_its_grant() {
         id: "read".into(),
         name: "file_read".into(),
         reads: vec![],
+        connection: None,
+        action: None,
     };
     let missing = WorkflowDocument::new(
         "fixture",
@@ -615,6 +621,8 @@ fn file_read_node() -> DocumentNode {
         id: "read".into(),
         name: "file_read".into(),
         reads: vec![],
+        connection: None,
+        action: None,
     }
 }
 
@@ -869,6 +877,8 @@ async fn a_dangerous_effect_cannot_run() {
                 id: "run".into(),
                 name: name.into(),
                 reads: vec![],
+                connection: None,
+                action: None,
             }],
             edges: vec![],
             on_low: BTreeMap::new(),

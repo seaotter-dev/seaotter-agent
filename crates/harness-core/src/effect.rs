@@ -11,6 +11,7 @@ pub enum Capability {
     FileRead,
     HttpGet,
     DangerousShell,
+    Composio,
 }
 
 /// A side effect executed by Rust. Named by a node in code, never by a model.

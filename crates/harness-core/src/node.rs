@@ -64,6 +64,8 @@ pub enum Node {
         id: NodeId,
         name: String,
         reads: Vec<String>,
+        connection: Option<String>,
+        action: Option<String>,
     },
 }
 

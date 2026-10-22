@@ -1,7 +1,8 @@
 //! The operations a consultant may use to build a workflow document.
 //!
-//! The effect names are `file_read` and `http_get`. Any other name is rejected
-//! and leaves the catalog unchanged.
+//! The effect names are `file_read`, `http_get`, and `composio`. Any other name
+//! is rejected and leaves the catalog unchanged. The `composio` grant is one
+//! action name.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -100,15 +101,56 @@ impl Catalog {
     }
 
     /// Allows `file_read` and `http_get` when that name is already granted.
+    /// `composio` is granted by one action name, and stores that action with
+    /// its connection id.
     pub fn add_effect(
         &mut self,
         id: impl Into<NodeId>,
         name: impl Into<String>,
         reads: Vec<String>,
+        connection: Option<String>,
+        action: Option<String>,
     ) -> Result<(), HarnessError> {
         let name = name.into();
+        if name == "composio" {
+            let Some(action) = action
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            else {
+                return Err(HarnessError::Workflow(
+                    "effect `composio` has no action".into(),
+                ));
+            };
+            let Some(connection) = connection
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+            else {
+                return Err(HarnessError::Workflow(
+                    "effect `composio` has no connection".into(),
+                ));
+            };
+            if !self.grants.contains(action) {
+                return Err(HarnessError::Workflow(format!(
+                    "effect `composio` action `{action}` has no grant"
+                )));
+            }
+            return self.insert(DocumentNode::Effect {
+                id: id.into(),
+                name,
+                reads,
+                connection: Some(connection.to_owned()),
+                action: Some(action.to_owned()),
+            });
+        }
         if name != "file_read" && name != "http_get" {
             return Err(HarnessError::Workflow(format!("unknown effect `{name}`")));
+        }
+        if connection.is_some() || action.is_some() {
+            return Err(HarnessError::Workflow(format!(
+                "effect `{name}` does not take a connection"
+            )));
         }
         if !self.grants.contains(&name) {
             return Err(HarnessError::Workflow(format!(
@@ -119,6 +161,8 @@ impl Catalog {
             id: id.into(),
             name,
             reads,
+            connection: None,
+            action: None,
         })
     }
 
@@ -250,7 +294,13 @@ fn apply_call(catalog: &mut Catalog, call: &Value) -> Result<(), HarnessError> {
             output,
             max_tokens,
         } => catalog.add_generate(id, task, reads, output, max_tokens),
-        CatalogCall::AddEffect { id, name, reads } => catalog.add_effect(id, name, reads),
+        CatalogCall::AddEffect {
+            id,
+            name,
+            reads,
+            connection,
+            action,
+        } => catalog.add_effect(id, name, reads, connection, action),
         CatalogCall::Connect { from, when, to } => catalog.connect(from, when, to),
         CatalogCall::SetGate { id, gate } => catalog.set_gate(id, gate),
         CatalogCall::SetLow { action, to } => catalog.set_low(action, to),
@@ -277,6 +327,10 @@ enum CatalogCall {
         id: NodeId,
         name: String,
         reads: Vec<String>,
+        #[serde(default)]
+        connection: Option<String>,
+        #[serde(default)]
+        action: Option<String>,
     },
     Connect {
         from: NodeId,

@@ -161,6 +161,8 @@ fn workflow() -> Workflow {
             id: "read".into(),
             name: "file_read".into(),
             reads: vec!["path".into()],
+            connection: None,
+            action: None,
         },
     ];
     Workflow::new("choose".into(), nodes, transition).unwrap()
