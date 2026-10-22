@@ -148,3 +148,54 @@ Tracked in Linear under the [Code-owned harness v2 — local Docker](https://lin
 6. Log and human gate
    * SEA-388 Persist each run on the volume and replay it
    * SEA-390 Add a local human-gate node
+
+## Goal (consultant MCP)
+
+The user installs a stdio MCP. The host Allow only lets that chat call the server. Seaotter stores the owner, the tier, the tool grant, and the human gate. A consultant reply may call the catalog. The saved document is the transition. A run does not ask the consultant which node is next, and the model request carries no tool list. The tool result includes a Mermaid wireframe of the graph.
+
+This phase grants one Composio effect on the workflow document. The v2 container image is unchanged.
+
+The issues listed under [consultant MCP slices](#consultant-mcp-slices) are this phase's work breakdown. Stay inside the non-goals.
+
+## Non-goals (consultant MCP)
+
+* A host permission blob stored as a grant
+* A `dangerous` tier, or a document path that loads `shell`
+* An MCP tool that adds a grant (`grant add` is a CLI subcommand)
+* Platform auth
+* A hosted HTTP API
+* The local page in the Local workflow app project
+
+`DangerousShell` in `crates/harness-effects/src/shell.rs` stays for the effects example. The document loader does not call it.
+
+## Consultant MCP acceptance
+
+* The host Allow only lets the chat call the MCP.
+* Seaotter stores the owner, the tier, the tool grant, and the human gate.
+* Tiers are `read` and `write`. A document that names `shell` or `dangerous` fails to load.
+* A tool result includes a Mermaid wireframe.
+* Composio is an effect backend. The workflow file stores a connection id and an action name, and it stores no token.
+* A later `platform` provider can replace Composio without a document change. This phase does not implement that provider.
+
+## Consultant MCP slices
+
+Tracked in Linear under the [Consultant MCP](https://linear.app/seaotter-dev/project/consultant-mcp-b6a29292e9de) project.
+
+1. Spec
+   * SEA-403 Land the consultant-MCP spec
+2. Document
+   * SEA-404 Add a serializable workflow document
+   * SEA-405 Run a workflow document on the machine
+3. Grants
+   * SEA-406 Require an owner, a tier, and a tool grant
+   * SEA-410 Skip a write effect until its human gate passes
+   * SEA-408 Write the grant decision to the run log
+4. Catalog
+   * SEA-407 Freeze the builder catalog
+   * SEA-409 Apply a consultant reply as catalog calls
+5. MCP
+   * SEA-412 Serve the stdio MCP
+   * SEA-414 Return the wireframe in the tool result
+6. Composio
+   * SEA-411 Run a granted Composio action
+   * SEA-413 Check the gates before the credential backend
