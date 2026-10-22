@@ -2,7 +2,8 @@
 //!
 //! Nodes are decide, generate, and effect. Branch edges are data. The
 //! document has no [`Transition`](crate::workflow::Transition) and no
-//! [`Step`](crate::node::Step). Running it is a later step.
+//! [`Step`](crate::node::Step). [`Machine::run_document`](crate::machine::Machine::run_document)
+//! follows the edges.
 
 use std::collections::{BTreeMap, BTreeSet};
 
