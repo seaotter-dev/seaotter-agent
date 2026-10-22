@@ -8,7 +8,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use harness_core::{
-    DecisionModel, HarnessError, Machine, RiskTier, Run, State, WorkflowDocument, apply_reply,
+    BranchWhen, ConfidenceAction, DecisionModel, DocumentNode, HarnessError, Machine, RiskTier,
+    Run, State, WorkflowDocument, apply_reply,
 };
 use serde_json::{Map, Value, json};
 
@@ -147,8 +148,8 @@ impl Server {
                     args.get("tier").and_then(Value::as_str).unwrap_or(""),
                     args.get("reply").and_then(Value::as_str).unwrap_or(""),
                 )
-                .map(|doc| serde_json::to_string(&doc).unwrap_or_default()),
-            "workflow_show" => self.show(),
+                .map(|doc| wireframe(&doc)),
+            "workflow_show" => self.load_workflow().map(|doc| wireframe(&doc)),
             "workflow_save" => self.save().map(|()| "saved".to_owned()),
             "workflow_run" => self.run().await.map(|run| {
                 let path: Vec<_> = run.path.iter().map(|id| id.0.as_str()).collect();
@@ -219,7 +220,7 @@ fn tool_definitions() -> Vec<Value> {
         .map(|name| {
             let (description, properties, required) = match name {
                 "workflow_propose" => (
-                    "Apply a recorded reply with the grants already on disk.",
+                    "Apply a recorded reply and return its flowchart.",
                     json!({
                         "owner": { "type": "string" },
                         "tier": { "type": "string" },
@@ -227,7 +228,11 @@ fn tool_definitions() -> Vec<Value> {
                     }),
                     json!(["owner", "tier", "reply"]),
                 ),
-                "workflow_show" => ("Return the saved workflow document.", json!({}), json!([])),
+                "workflow_show" => (
+                    "Return a flowchart of the saved workflow.",
+                    json!({}),
+                    json!([]),
+                ),
                 "workflow_save" => (
                     "Write the proposed workflow document to disk.",
                     json!({}),
@@ -248,6 +253,77 @@ fn tool_definitions() -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn wireframe(doc: &WorkflowDocument) -> String {
+    let mut lines = vec!["flowchart TD".to_owned()];
+    for node in &doc.nodes {
+        let id = node.id();
+        let kind = match node {
+            DocumentNode::Decide { .. } => "decide",
+            DocumentNode::Generate { .. } => "generate",
+            DocumentNode::Effect { .. } => "effect",
+        };
+        let mut label = format!("{id} {kind}");
+        if let DocumentNode::Generate {
+            gate: Some(gate), ..
+        } = node
+        {
+            label.push_str(&format!(" allow {}", gate.allow));
+        }
+        lines.push(format!("  {id}[\"{}\"]", escape_label(&label)));
+    }
+    for edge in &doc.edges {
+        lines.push(format!(
+            "  {} -->|\"{}\"| {}",
+            edge.from,
+            escape_label(&branch_label(&edge.when)),
+            edge.to
+        ));
+    }
+    for node in &doc.nodes {
+        let DocumentNode::Decide { id, policy, .. } = node else {
+            continue;
+        };
+        let Some(to) = doc.on_low.get(&policy.on_low) else {
+            continue;
+        };
+        lines.push(format!(
+            "  {id} -->|\"{}\"| {to}",
+            escape_label(action_name(policy.on_low))
+        ));
+    }
+    format!(
+        "Display this flowchart.\n\n```mermaid\n{}\n```\n",
+        lines.join("\n")
+    )
+}
+
+fn branch_label(when: &BranchWhen) -> String {
+    match when {
+        BranchWhen::Always => "always".to_owned(),
+        BranchWhen::Label { question, equals } => format!("{question} equals {equals}"),
+        BranchWhen::Other { question } => format!("{question} other"),
+        BranchWhen::Generated => "generated".to_owned(),
+        BranchWhen::Skipped => "skipped".to_owned(),
+        BranchWhen::State { key, equals } => {
+            format!("{key} equals {}", if *equals { "true" } else { "false" })
+        }
+    }
+}
+
+fn action_name(action: ConfidenceAction) -> &'static str {
+    match action {
+        ConfidenceAction::Escalate => "escalate",
+        ConfidenceAction::RetryStronger => "retry_stronger",
+        ConfidenceAction::SafeDefault => "safe_default",
+        ConfidenceAction::Human => "human",
+        ConfidenceAction::Continue => "continue",
+    }
+}
+
+fn escape_label(label: &str) -> String {
+    label.replace('\\', "\\\\").replace('"', "'")
 }
 
 fn tool_text(text: String, is_error: bool) -> Value {
