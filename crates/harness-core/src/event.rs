@@ -7,8 +7,30 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::document::RiskTier;
 use crate::error::HarnessError;
 use crate::node::NodeId;
+
+/// Whether a document effect's human gate allowed the call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum GateOutcome {
+    Passed,
+    Skipped,
+    NotRequired,
+}
+
+/// The owner, tier, tool, and gate outcome for one effect.
+///
+/// A host permission and a credential are not fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantDecision {
+    pub owner: String,
+    pub tier: RiskTier,
+    pub tool: String,
+    pub gate: GateOutcome,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -41,12 +63,14 @@ pub struct Event {
     pub usage: Usage,
 }
 
-/// Append-only log of decide, generate, and effect steps.
+/// Append-only log of decide, generate, and effect steps, plus one grant
+/// decision per document effect that was skipped or run.
 ///
 /// Events can be read. Nothing in this type updates or removes one.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EventLog {
     events: Vec<Event>,
+    grants: Vec<GrantDecision>,
 }
 
 impl EventLog {
@@ -66,8 +90,28 @@ impl EventLog {
         self.events.is_empty()
     }
 
+    pub fn grants(&self) -> &[GrantDecision] {
+        &self.grants
+    }
+
     pub(crate) fn push(&mut self, event: Event) {
         self.events.push(event);
+    }
+
+    pub(crate) fn push_grant(&mut self, decision: GrantDecision) {
+        self.grants.push(decision);
+    }
+
+    /// Appends this log to `path`. The header and step lines match
+    /// [`append_run`]. Each grant decision is one later line with `run_id`,
+    /// `owner`, `tier`, `tool`, and `gate`.
+    pub fn append_to(
+        &self,
+        path: &Path,
+        workflow: &str,
+        user_id: &str,
+    ) -> Result<String, HarnessError> {
+        write_run(path, workflow, user_id, &self.events, &self.grants)
     }
 }
 
@@ -125,6 +169,15 @@ struct StoredStep {
     usage: Usage,
 }
 
+#[derive(Serialize)]
+struct GrantLine<'a> {
+    run_id: &'a str,
+    owner: &'a str,
+    tier: RiskTier,
+    tool: &'a str,
+    gate: GateOutcome,
+}
+
 /// Appends one run to `path` as JSON lines. The first line is the header.
 /// Each later line is one decide, generate, or effect step. The write is a
 /// single append. This function does not read provider keys.
@@ -133,6 +186,16 @@ pub fn append_run(
     workflow: &str,
     user_id: &str,
     events: &[Event],
+) -> Result<String, HarnessError> {
+    write_run(path, workflow, user_id, events, &[])
+}
+
+fn write_run(
+    path: &Path,
+    workflow: &str,
+    user_id: &str,
+    events: &[Event],
+    grants: &[GrantDecision],
 ) -> Result<String, HarnessError> {
     let run_id = new_run_id();
     let mut body = json_line(&RunHeader {
@@ -150,6 +213,15 @@ pub fn append_run(
             outcome: &event.output,
             confidence: event.confidence,
             usage: &event.usage,
+        })?);
+    }
+    for decision in grants {
+        body.push_str(&json_line(&GrantLine {
+            run_id: &run_id,
+            owner: &decision.owner,
+            tier: decision.tier,
+            tool: &decision.tool,
+            gate: decision.gate,
         })?);
     }
     if let Some(parent) = path.parent()

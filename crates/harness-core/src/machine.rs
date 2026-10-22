@@ -7,7 +7,7 @@ use crate::decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse};
 use crate::document::{BranchWhen, DocumentNode, RiskTier, WorkflowDocument};
 use crate::effect::{Capability, Effect};
 use crate::error::HarnessError;
-use crate::event::{Event, EventKind, EventLog, Usage, input_hash};
+use crate::event::{Event, EventKind, EventLog, GateOutcome, GrantDecision, Usage, input_hash};
 use crate::generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, OutputSpec};
 use crate::node::{Gate, Node, NodeId};
 use crate::policy::{ConfidenceAction, ConfidencePolicy};
@@ -348,6 +348,19 @@ impl Machine {
             .human_gate
             .as_ref()
             .is_some_and(|gate| gate_open(gate, document_policy(doc, &gate.decide), decisions));
+        let gate = if doc.tier != RiskTier::Write {
+            GateOutcome::NotRequired
+        } else if gate_passed {
+            GateOutcome::Passed
+        } else {
+            GateOutcome::Skipped
+        };
+        events.push_grant(GrantDecision {
+            owner: doc.owner.clone(),
+            tier: doc.tier,
+            tool: name.to_owned(),
+            gate,
+        });
         if doc.tier == RiskTier::Write && !gate_passed {
             return Ok((Outcome::Skipped, None));
         }
