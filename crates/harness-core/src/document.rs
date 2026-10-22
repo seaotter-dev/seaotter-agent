@@ -27,11 +27,14 @@ pub enum RiskTier {
 /// A saved workflow. `to` on an edge may name a sink that is not a node.
 ///
 /// Loading requires an owner, a [`RiskTier`], and a grant for every effect.
+/// A write effect runs only after `human_gate` has passed.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkflowDocument {
     pub owner: String,
     pub tier: RiskTier,
     pub grants: BTreeSet<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub human_gate: Option<Gate>,
     pub start: NodeId,
     pub nodes: Vec<DocumentNode>,
     pub edges: Vec<BranchEdge>,
@@ -46,6 +49,8 @@ struct DocumentFile {
     tier: RiskTier,
     #[serde(default)]
     grants: BTreeSet<String>,
+    #[serde(default)]
+    human_gate: Option<Gate>,
     start: NodeId,
     nodes: Vec<DocumentNode>,
     edges: Vec<BranchEdge>,
@@ -204,11 +209,30 @@ impl WorkflowDocument {
             owner,
             tier,
             grants,
+            human_gate: None,
             start,
             nodes,
             edges,
             on_low,
         })
+    }
+
+    /// Points the document's human gate at a Decide node.
+    ///
+    /// A write-tier effect stays skipped until this gate passes.
+    pub fn with_human_gate(mut self, gate: Gate) -> Result<Self, HarnessError> {
+        let points_at_decide = self
+            .nodes
+            .iter()
+            .any(|other| matches!(other, DocumentNode::Decide { id, .. } if id == &gate.decide));
+        if !points_at_decide {
+            return Err(HarnessError::Workflow(format!(
+                "human gate must point at a Decide node, got `{}`",
+                gate.decide
+            )));
+        }
+        self.human_gate = Some(gate);
+        Ok(self)
     }
 }
 
@@ -218,7 +242,8 @@ impl<'de> Deserialize<'de> for WorkflowDocument {
         D: Deserializer<'de>,
     {
         let file = DocumentFile::deserialize(deserializer)?;
-        WorkflowDocument::new(
+        let gate = file.human_gate;
+        let doc = WorkflowDocument::new(
             file.owner,
             file.tier,
             file.grants,
@@ -227,6 +252,10 @@ impl<'de> Deserialize<'de> for WorkflowDocument {
             file.edges,
             file.on_low,
         )
-        .map_err(D::Error::custom)
+        .map_err(D::Error::custom)?;
+        match gate {
+            Some(gate) => doc.with_human_gate(gate).map_err(D::Error::custom),
+            None => Ok(doc),
+        }
     }
 }

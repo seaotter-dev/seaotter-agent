@@ -4,7 +4,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse};
-use crate::document::{BranchWhen, DocumentNode, WorkflowDocument};
+use crate::document::{BranchWhen, DocumentNode, RiskTier, WorkflowDocument};
 use crate::effect::{Capability, Effect};
 use crate::error::HarnessError;
 use crate::event::{Event, EventKind, EventLog, Usage, input_hash};
@@ -221,7 +221,9 @@ impl Machine {
     ///
     /// An id that is not a node is a sink: the run pushes it on the path and
     /// completes. No matching edge also completes the run, so a missing
-    /// `approved` value does not visit a later generate node.
+    /// `approved` value does not visit a later generate node. A write-tier
+    /// effect is skipped until `human_gate` passes. An effect named `shell`
+    /// or `dangerous`, or one whose capability is `DangerousShell`, does not run.
     pub async fn run_document(
         &self,
         doc: &WorkflowDocument,
@@ -251,8 +253,23 @@ impl Machine {
             };
             path.push(current.clone());
             let node = node_from_document(doc_node);
-            let (outcome, low_edge) = self
-                .step(
+            let effect_name = match doc_node {
+                DocumentNode::Effect { name, .. } => Some(name.clone()),
+                _ => None,
+            };
+            let (outcome, low_edge) = if let Some(name) = effect_name {
+                self.document_effect(
+                    doc,
+                    &name,
+                    &node,
+                    &mut state,
+                    &decisions,
+                    &mut events,
+                    &mut trace,
+                )
+                .await?
+            } else {
+                self.step(
                     &|id| document_policy(doc, id),
                     &node,
                     &mut state,
@@ -260,7 +277,8 @@ impl Machine {
                     &mut events,
                     &mut trace,
                 )
-                .await?;
+                .await?
+            };
             record_node_output(&current, &outcome, &mut state, &mut decisions)?;
 
             if let Some(action) = low_edge {
@@ -292,6 +310,56 @@ impl Machine {
                 }
             }
         }
+    }
+
+    /// Runs one document effect, or skips a write effect whose human gate is closed.
+    ///
+    /// `shell`, `dangerous`, and `DangerousShell` return before `Effect::run`.
+    async fn document_effect(
+        &self,
+        doc: &WorkflowDocument,
+        name: &str,
+        node: &Node,
+        state: &mut State,
+        decisions: &Decisions,
+        events: &mut EventLog,
+        trace: &mut Trace<'_>,
+    ) -> Result<(Outcome, Option<ConfidenceAction>), HarnessError> {
+        if name == "shell"
+            || name == "dangerous"
+            || self
+                .effects
+                .get(name)
+                .is_some_and(|effect| effect.capability() == Capability::DangerousShell)
+        {
+            return Err(HarnessError::Workflow(format!(
+                "effect `{name}` cannot run"
+            )));
+        }
+        if doc.owner.trim().is_empty() {
+            return Err(HarnessError::Workflow("document has no owner".into()));
+        }
+        if !doc.grants.contains(name) {
+            return Err(HarnessError::Workflow(format!(
+                "effect `{name}` has no grant"
+            )));
+        }
+        let gate_passed = doc
+            .human_gate
+            .as_ref()
+            .is_some_and(|gate| gate_open(gate, document_policy(doc, &gate.decide), decisions));
+        if doc.tier == RiskTier::Write && !gate_passed {
+            return Ok((Outcome::Skipped, None));
+        }
+        self.step(
+            &|id| document_policy(doc, id),
+            node,
+            state,
+            decisions,
+            events,
+            trace,
+        )
+        .await
     }
 
     /// Runs one node. The second value is the low-confidence edge a `Decide`
