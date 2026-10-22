@@ -314,7 +314,9 @@ impl Machine {
 
     /// Runs one document effect, or skips a write effect whose human gate is closed.
     ///
-    /// `shell`, `dangerous`, and `DangerousShell` return before `Effect::run`.
+    /// `shell`, `dangerous`, `platform`, and `DangerousShell` return before
+    /// `Effect::run`. A composio call reads its key only after the owner, the
+    /// grant, and the human gate.
     async fn document_effect(
         &self,
         doc: &WorkflowDocument,
@@ -327,10 +329,10 @@ impl Machine {
     ) -> Result<(Outcome, Option<ConfidenceAction>), HarnessError> {
         if name == "shell"
             || name == "dangerous"
-            || self
-                .effects
-                .get(name)
-                .is_some_and(|effect| effect.capability() == Capability::DangerousShell)
+            || name == "platform"
+            || self.effects.get(name).is_some_and(|effect| {
+                effect.capability() == Capability::DangerousShell || effect.provider() == "platform"
+            })
         {
             return Err(HarnessError::Workflow(format!(
                 "effect `{name}` cannot run"
@@ -387,6 +389,16 @@ impl Machine {
         });
         if doc.tier == RiskTier::Write && !gate_passed {
             return Ok((Outcome::Skipped, None));
+        }
+        if name == "composio"
+            && self
+                .effects
+                .get(name)
+                .is_some_and(|effect| effect.provider() != "composio")
+        {
+            return Err(HarnessError::Workflow(format!(
+                "effect `{name}` cannot run"
+            )));
         }
         self.step(
             &|id| document_policy(doc, id),

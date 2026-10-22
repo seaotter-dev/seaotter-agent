@@ -342,7 +342,7 @@ fn a_document_without_an_owner_or_a_known_tier_fails_to_load() {
 
 #[test]
 fn shell_and_dangerous_effects_fail_even_with_a_grant() {
-    for name in ["shell", "dangerous"] {
+    for name in ["shell", "dangerous", "platform"] {
         let loaded = WorkflowDocument::new(
             "fixture",
             RiskTier::Write,

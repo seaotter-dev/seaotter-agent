@@ -142,6 +142,10 @@ impl Effect for Composio {
         Capability::Composio
     }
 
+    fn provider(&self) -> &str {
+        "composio"
+    }
+
     fn run(&self, input: Value) -> BoxFuture<'_, Result<Value, HarnessError>> {
         Box::pin(self.execute(input))
     }

@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use harness_core::{
-    BoxFuture, Capability, DocumentNode, Effect, HarnessError, Machine, RiskTier, State,
-    WorkflowDocument,
+    BoxFuture, Capability, ConfidenceAction, ConfidencePolicy, DocumentNode, Effect, Gate,
+    GateOutcome, HarnessError, Machine, RiskTier, State, WorkflowDocument,
 };
 use harness_effects::{Composio, ExecuteCall};
 use serde_json::{Value, json};
@@ -108,8 +108,128 @@ async fn an_action_outside_the_grant_makes_no_request() {
         err,
         HarnessError::Workflow(format!("effect `composio` action `{ACTION}` has no grant"))
     );
+    assert!(!err.to_string().contains("COMPOSIO_API_KEY"), "{err}");
     assert!(seen.lock().unwrap().is_empty());
     assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn composio_names_its_provider() {
+    assert_eq!(Composio::new(ACTION).provider(), "composio");
+}
+
+struct PlatformProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Effect for PlatformProvider {
+    fn name(&self) -> &str {
+        "composio"
+    }
+
+    fn provider(&self) -> &str {
+        "platform"
+    }
+
+    fn capability(&self) -> Capability {
+        Capability::Composio
+    }
+
+    fn run(&self, input: Value) -> BoxFuture<'_, Result<Value, HarnessError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(input) })
+    }
+}
+
+#[tokio::test]
+async fn a_platform_provider_does_not_run() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let err = Machine::builder()
+        .effect(PlatformProvider {
+            calls: Arc::clone(&calls),
+        })
+        .grant(Capability::Composio)
+        .build()
+        .run_document(&document(), State::new())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        HarnessError::Workflow("effect `composio` cannot run".into())
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn the_gates_return_before_composio_reads_a_key() {
+    let (seen, transport) = records();
+    let mut doc = document();
+    doc.owner.clear();
+    let err = Machine::builder()
+        .effect(
+            Composio::new(ACTION)
+                .with_key(None)
+                .with_transport(transport),
+        )
+        .grant(Capability::Composio)
+        .build()
+        .run_document(&doc, State::new())
+        .await
+        .unwrap_err();
+    assert_eq!(err, HarnessError::Workflow("document has no owner".into()));
+    assert!(!err.to_string().contains("COMPOSIO_API_KEY"), "{err}");
+    assert!(seen.lock().unwrap().is_empty());
+
+    let (seen, transport) = records();
+    let run = Machine::builder()
+        .effect(
+            Composio::new(ACTION)
+                .with_key(None)
+                .with_transport(transport),
+        )
+        .grant(Capability::Composio)
+        .build()
+        .run_document(&closed_write(), State::new())
+        .await
+        .unwrap();
+    assert_eq!(run.events.grants()[0].gate, GateOutcome::Skipped);
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+fn closed_write() -> WorkflowDocument {
+    WorkflowDocument::new(
+        "fixture",
+        RiskTier::Write,
+        [ACTION],
+        "send".into(),
+        vec![
+            DocumentNode::Decide {
+                id: "allow".into(),
+                reads: vec![],
+                questions: Default::default(),
+                policy: ConfidencePolicy {
+                    min_confidence: 0.7,
+                    on_low: ConfidenceAction::SafeDefault,
+                },
+            },
+            DocumentNode::Effect {
+                id: "send".into(),
+                name: "composio".into(),
+                reads: vec![],
+                connection: Some(CONNECTION.into()),
+                action: Some(ACTION.into()),
+            },
+        ],
+        vec![],
+        Default::default(),
+    )
+    .unwrap()
+    .with_human_gate(Gate {
+        decide: "allow".into(),
+        question: "allow".into(),
+        allow: "true".into(),
+    })
+    .unwrap()
 }
 
 #[tokio::test]
