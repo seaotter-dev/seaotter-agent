@@ -18,6 +18,7 @@
 //! - Question or node skeletons generated at design time are written to files
 //!   for review. The harness has no path to compile or run generated Rust.
 
+mod catalog;
 mod decision;
 mod diff;
 mod document;
@@ -34,6 +35,7 @@ mod state;
 mod validate;
 mod workflow;
 
+pub use catalog::Catalog;
 pub use decision::{
     Answer, DecisionModel, DecisionRequest, DecisionRequestBuilder, DecisionResponse, NoulCriteria,
     Question,
