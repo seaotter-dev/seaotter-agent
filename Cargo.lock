@@ -1436,6 +1436,15 @@ name = "seaotter-agent"
 version = "0.1.0"
 
 [[package]]
+name = "seaotter-mcp"
+version = "0.1.0"
+dependencies = [
+ "harness-core",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

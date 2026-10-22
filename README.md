@@ -68,3 +68,33 @@ docker run --rm -v "$(pwd)/data:/data" seaotter-agent:dev --workflow examples/ef
 ```
 
 The default bridge network gives the container its own stack, so `127.0.0.1` inside it is not the host. `--network host` uses the host network namespace. On Docker Desktop that host is the Linux VM, so a service bound only to the Mac's localhost is still unreachable. Neither mode widens the `HttpGet` allowlist or grants the shell.
+
+## Consultant MCP
+
+`seaotter-mcp` speaks MCP over stdio. The tools are `workflow_propose`, `workflow_show`, `workflow_save`, `workflow_run`, and `grant_list`. A person adds a grant with `seaotter-mcp grant add <name>`. That subcommand is not an MCP tool.
+
+The process inherits keys from the environment. The workflow file does not store them.
+
+Claude:
+
+```json
+{
+  "mcpServers": {
+    "seaotter": {
+      "command": "seaotter-mcp"
+    }
+  }
+}
+```
+
+Cursor, in `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "seaotter": {
+      "command": "seaotter-mcp"
+    }
+  }
+}
+```
