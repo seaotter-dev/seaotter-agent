@@ -8,6 +8,25 @@ use seaotter_mcp::{Server, workflow_file};
 use serde_json::json;
 
 const REPLY: &str = include_str!("../../../crates/harness-core/fixtures/consultant-reply.json");
+const GATED: &str = include_str!("../../../crates/harness-core/fixtures/gated-draft.json");
+const REJECTED: &str = r#"[
+  {
+    "op": "add_decide",
+    "id": "other",
+    "reads": ["ticket"],
+    "questions": {
+      "route": {
+        "kind": "choice",
+        "instructions": "Which team should handle this support ticket?",
+        "criteria": {
+          "billing": "Charges, refunds, invoices, and payment methods."
+        }
+      }
+    },
+    "policy": { "min_confidence": 0.7, "on_low": "safe_default" }
+  },
+  { "op": "add_grant", "name": "file_read" }
+]"#;
 
 struct LabelDecision {
     top: &'static str,
@@ -111,7 +130,10 @@ async fn propose_ignores_a_host_permission_and_the_file_stores_no_key() {
         .unwrap();
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(response["result"]["isError"], false);
-    assert!(text.contains("classify"), "{text}");
+    assert!(text.contains("Display this flowchart."), "{text}");
+    assert!(text.contains("classify decide"), "{text}");
+    assert!(text.contains("route equals billing"), "{text}");
+    assert!(text.contains("safe_default"), "{text}");
     assert!(!text.contains("host_permission"), "{text}");
     assert!(!text.contains("host-allow-blob"), "{text}");
 
@@ -138,6 +160,57 @@ async fn propose_ignores_a_host_permission_and_the_file_stores_no_key() {
     ] {
         assert!(!saved.contains(key), "{key} in {saved}");
     }
+}
+
+#[tokio::test]
+async fn show_returns_the_allow_condition() {
+    let directory = dir("show");
+    std::fs::write(workflow_file(&directory), GATED).unwrap();
+    let mut server = Server::open(&directory);
+    let response = server
+        .handle(&json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "workflow_show", "arguments": {} }
+        }))
+        .await
+        .unwrap();
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(response["result"]["isError"], false);
+    assert!(text.contains("Display this flowchart."), "{text}");
+    assert!(text.contains("draft generate allow true"), "{text}");
+}
+
+#[tokio::test]
+async fn a_rejected_propose_keeps_the_previous_graph() {
+    let directory = dir("reject");
+    let mut server = Server::open(&directory);
+    server.propose("fixture", "read", REPLY).unwrap();
+    let response = server
+        .handle(&json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "workflow_propose",
+                "arguments": {
+                    "owner": "fixture",
+                    "tier": "read",
+                    "reply": REJECTED
+                }
+            }
+        }))
+        .await
+        .unwrap();
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(response["result"]["isError"], true);
+    assert!(text.contains("grant add is not a catalog call"), "{text}");
+    assert!(!text.contains("Display this flowchart."), "{text}");
+    server.save().unwrap();
+    let saved = std::fs::read_to_string(workflow_file(&directory)).unwrap();
+    assert!(saved.contains("classify"), "{saved}");
+    assert!(!saved.contains("other"), "{saved}");
 }
 
 #[tokio::test]
