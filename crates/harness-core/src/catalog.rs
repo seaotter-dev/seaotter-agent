@@ -5,6 +5,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::Deserialize;
+use serde_json::Value;
+
 use crate::decision::Question;
 use crate::document::{BranchEdge, BranchWhen, DocumentNode, RiskTier, WorkflowDocument};
 use crate::error::HarnessError;
@@ -197,4 +200,95 @@ impl Catalog {
         self.nodes.push(node);
         Ok(())
     }
+}
+
+/// Applies a recorded consultant reply. The owner, tier, and grants come from
+/// the arguments. A failed call returns that error and no document.
+pub fn apply_reply(
+    owner: impl Into<String>,
+    tier: RiskTier,
+    grants: impl IntoIterator<Item = impl Into<String>>,
+    reply: &str,
+) -> Result<WorkflowDocument, HarnessError> {
+    let calls: Vec<Value> = serde_json::from_str(reply)
+        .map_err(|err| HarnessError::Workflow(format!("consultant reply: {err}")))?;
+    let mut catalog = Catalog::new(owner, tier, grants)?;
+    for call in calls {
+        apply_call(&mut catalog, &call)?;
+    }
+    catalog.document()
+}
+
+fn apply_call(catalog: &mut Catalog, call: &Value) -> Result<(), HarnessError> {
+    let op = call.get("op").and_then(Value::as_str).unwrap_or("");
+    if op == "add_grant" || op == "grant_add" {
+        return Err(HarnessError::Workflow(
+            "grant add is not a catalog call".into(),
+        ));
+    }
+    if !matches!(
+        op,
+        "add_decide" | "add_generate" | "add_effect" | "connect" | "set_gate" | "set_low"
+    ) {
+        return Err(HarnessError::Workflow(format!(
+            "unknown catalog call `{op}`"
+        )));
+    }
+    let parsed: CatalogCall = serde_json::from_value(call.clone())
+        .map_err(|err| HarnessError::Workflow(format!("consultant reply: {err}")))?;
+    match parsed {
+        CatalogCall::AddDecide {
+            id,
+            reads,
+            questions,
+            policy,
+        } => catalog.add_decide(id, reads, questions, policy),
+        CatalogCall::AddGenerate {
+            id,
+            task,
+            reads,
+            output,
+            max_tokens,
+        } => catalog.add_generate(id, task, reads, output, max_tokens),
+        CatalogCall::AddEffect { id, name, reads } => catalog.add_effect(id, name, reads),
+        CatalogCall::Connect { from, when, to } => catalog.connect(from, when, to),
+        CatalogCall::SetGate { id, gate } => catalog.set_gate(id, gate),
+        CatalogCall::SetLow { action, to } => catalog.set_low(action, to),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+enum CatalogCall {
+    AddDecide {
+        id: NodeId,
+        reads: Vec<String>,
+        questions: BTreeMap<String, Question>,
+        policy: ConfidencePolicy,
+    },
+    AddGenerate {
+        id: NodeId,
+        task: String,
+        reads: Vec<String>,
+        output: OutputSpec,
+        max_tokens: u32,
+    },
+    AddEffect {
+        id: NodeId,
+        name: String,
+        reads: Vec<String>,
+    },
+    Connect {
+        from: NodeId,
+        when: BranchWhen,
+        to: NodeId,
+    },
+    SetGate {
+        id: NodeId,
+        gate: Gate,
+    },
+    SetLow {
+        action: ConfidenceAction,
+        to: NodeId,
+    },
 }

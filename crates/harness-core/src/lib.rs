@@ -35,7 +35,7 @@ mod state;
 mod validate;
 mod workflow;
 
-pub use catalog::Catalog;
+pub use catalog::{Catalog, apply_reply};
 pub use decision::{
     Answer, DecisionModel, DecisionRequest, DecisionRequestBuilder, DecisionResponse, NoulCriteria,
     Question,
