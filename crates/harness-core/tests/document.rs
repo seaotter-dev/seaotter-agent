@@ -3,12 +3,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use harness_core::{
-    Answer, BoxFuture, BranchEdge, BranchWhen, ConfidenceAction, ConfidencePolicy, DecisionModel,
-    DecisionRequest, DecisionResponse, DocumentNode, EventKind, Gate, GenOutput, GenRequest,
-    GenResponse, GenerativeModel, HarnessError, JsonSchema, Machine, NodeId, OutputSpec, Question,
-    RiskTier, RunStatus, State, Usage, WorkflowDocument,
+    Answer, BoxFuture, BranchEdge, BranchWhen, Capability, ConfidenceAction, ConfidencePolicy,
+    DecisionModel, DecisionRequest, DecisionResponse, DocumentNode, Effect, EventKind, Gate,
+    GenOutput, GenRequest, GenResponse, GenerativeModel, HarnessError, JsonSchema, Machine, NodeId,
+    OutputSpec, Question, RiskTier, RunStatus, State, Usage, WorkflowDocument,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 
 const TICKET_ROUTER: &str = include_str!("../fixtures/ticket-router.json");
 const GATED_DRAFT: &str = include_str!("../fixtures/gated-draft.json");
@@ -606,5 +606,268 @@ async fn missing_approval_does_not_visit_draft() {
             .events
             .iter()
             .any(|event| event.kind == EventKind::Generate)
+    );
+}
+
+fn file_read_node() -> DocumentNode {
+    DocumentNode::Effect {
+        id: "read".into(),
+        name: "file_read".into(),
+        reads: vec![],
+    }
+}
+
+fn allow_decide() -> DocumentNode {
+    DocumentNode::Decide {
+        id: "allow".into(),
+        reads: vec![],
+        questions: BTreeMap::from([(
+            "allow".into(),
+            Question::choice("May this write run?", [("true", "Yes"), ("false", "No")]).unwrap(),
+        )]),
+        policy: ConfidencePolicy {
+            min_confidence: 0.7,
+            on_low: ConfidenceAction::SafeDefault,
+        },
+    }
+}
+
+fn granted_read(
+    tier: RiskTier,
+    nodes: Vec<DocumentNode>,
+    edges: Vec<BranchEdge>,
+) -> WorkflowDocument {
+    WorkflowDocument::new(
+        "fixture",
+        tier,
+        ["file_read"],
+        nodes[0].id().clone(),
+        nodes,
+        edges,
+        BTreeMap::new(),
+    )
+    .unwrap()
+}
+
+struct CountingEffect {
+    name: &'static str,
+    capability: Capability,
+    calls: Arc<AtomicUsize>,
+}
+
+impl Effect for CountingEffect {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn capability(&self) -> Capability {
+        self.capability
+    }
+
+    fn run(&self, input: Value) -> BoxFuture<'_, Result<Value, HarnessError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { Ok(input) })
+    }
+}
+
+fn counting(name: &'static str, capability: Capability) -> (Arc<AtomicUsize>, CountingEffect) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    (
+        Arc::clone(&calls),
+        CountingEffect {
+            name,
+            capability,
+            calls,
+        },
+    )
+}
+
+#[tokio::test]
+async fn a_read_effect_runs_when_the_grant_is_present() {
+    let doc = granted_read(RiskTier::Read, vec![file_read_node()], vec![]);
+    let (calls, effect) = counting("file_read", Capability::FileRead);
+    let run = Machine::builder()
+        .effect(effect)
+        .grant(Capability::FileRead)
+        .build()
+        .run_document(&doc, State::new())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        run.events
+            .iter()
+            .any(|event| event.kind == EventKind::Effect)
+    );
+    assert_eq!(ends_at(&run.path), Some("read"));
+}
+
+#[tokio::test]
+async fn a_write_effect_waits_for_the_human_gate() {
+    let skipped = BranchEdge {
+        from: "read".into(),
+        when: BranchWhen::Skipped,
+        to: "held".into(),
+    };
+    let closed = granted_read(
+        RiskTier::Write,
+        vec![file_read_node()],
+        vec![skipped.clone()],
+    );
+    let (calls, effect) = counting("file_read", Capability::FileRead);
+    let held = Machine::builder()
+        .effect(effect)
+        .grant(Capability::FileRead)
+        .build()
+        .run_document(&closed, State::new())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        held.events
+            .iter()
+            .all(|event| event.kind != EventKind::Effect)
+    );
+    assert_eq!(ends_at(&held.path), Some("held"));
+
+    let mut waiting = granted_read(
+        RiskTier::Write,
+        vec![allow_decide(), file_read_node()],
+        vec![
+            BranchEdge {
+                from: "allow".into(),
+                when: BranchWhen::Always,
+                to: "read".into(),
+            },
+            skipped,
+        ],
+    );
+    waiting = waiting
+        .with_human_gate(Gate {
+            decide: "allow".into(),
+            question: "allow".into(),
+            allow: "true".into(),
+        })
+        .unwrap();
+    let (calls, effect) = counting("file_read", Capability::FileRead);
+    let denied = Machine::builder()
+        .decision(LabelDecision {
+            top: "false",
+            confidence: 0.9,
+        })
+        .effect(effect)
+        .grant(Capability::FileRead)
+        .build()
+        .run_document(&waiting, State::new())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        denied
+            .events
+            .iter()
+            .all(|event| event.kind != EventKind::Effect)
+    );
+    assert_eq!(ends_at(&denied.path), Some("held"));
+
+    let (calls, effect) = counting("file_read", Capability::FileRead);
+    let allowed = Machine::builder()
+        .decision(LabelDecision {
+            top: "true",
+            confidence: 0.9,
+        })
+        .effect(effect)
+        .grant(Capability::FileRead)
+        .build()
+        .run_document(&waiting, State::new())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        allowed
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::Effect)
+    );
+    assert_eq!(ends_at(&allowed.path), Some("read"));
+}
+
+#[tokio::test]
+async fn a_dangerous_effect_cannot_run() {
+    for name in ["shell", "dangerous"] {
+        let doc = WorkflowDocument {
+            owner: "fixture".into(),
+            tier: RiskTier::Write,
+            grants: BTreeSet::from([name.to_owned()]),
+            human_gate: None,
+            start: "run".into(),
+            nodes: vec![DocumentNode::Effect {
+                id: "run".into(),
+                name: name.into(),
+                reads: vec![],
+            }],
+            edges: vec![],
+            on_low: BTreeMap::new(),
+        };
+        let (calls, effect) = counting(name, Capability::FileRead);
+        let err = Machine::builder()
+            .effect(effect)
+            .grant(Capability::FileRead)
+            .build()
+            .run_document(&doc, State::new())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            HarnessError::Workflow(format!("effect `{name}` cannot run"))
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    let doc = granted_read(RiskTier::Read, vec![file_read_node()], vec![]);
+    let (calls, effect) = counting("file_read", Capability::DangerousShell);
+    let err = Machine::builder()
+        .effect(effect)
+        .grant(Capability::DangerousShell)
+        .build()
+        .run_document(&doc, State::new())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        HarnessError::Workflow("effect `file_read` cannot run".into())
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_human_gate_must_point_at_a_decide_node() {
+    let doc = granted_read(RiskTier::Write, vec![file_read_node()], vec![]);
+    let err = doc.with_human_gate(Gate {
+        decide: "missing".into(),
+        question: "allow".into(),
+        allow: "true".into(),
+    });
+    assert_eq!(
+        err,
+        Err(HarnessError::Workflow(
+            "human gate must point at a Decide node, got `missing`".into()
+        ))
+    );
+    let json = r#"{
+        "owner": "fixture",
+        "tier": "write",
+        "grants": ["file_read"],
+        "human_gate": { "decide": "missing", "question": "allow", "allow": "true" },
+        "start": "read",
+        "nodes": [{ "kind": "effect", "id": "read", "name": "file_read", "reads": [] }],
+        "edges": []
+    }"#;
+    let loaded = serde_json::from_str::<WorkflowDocument>(json).unwrap_err();
+    assert!(
+        loaded
+            .to_string()
+            .contains("human gate must point at a Decide node"),
+        "{loaded}"
     );
 }
