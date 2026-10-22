@@ -1,8 +1,12 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use harness_core::{
-    BranchEdge, BranchWhen, ConfidenceAction, ConfidencePolicy, DocumentNode, Gate, HarnessError,
-    JsonSchema, NodeId, OutputSpec, Question, WorkflowDocument,
+    Answer, BoxFuture, BranchEdge, BranchWhen, ConfidenceAction, ConfidencePolicy, DecisionModel,
+    DecisionRequest, DecisionResponse, DocumentNode, EventKind, Gate, GenOutput, GenRequest,
+    GenResponse, GenerativeModel, HarnessError, JsonSchema, Machine, NodeId, OutputSpec, Question,
+    RunStatus, State, Usage, WorkflowDocument,
 };
 use serde_json::json;
 
@@ -262,5 +266,189 @@ fn new_rejects_a_document_the_machine_cannot_load() {
         Err(HarnessError::Workflow(
             "Continue is not a low-confidence edge".into()
         ))
+    );
+}
+
+struct LabelDecision {
+    top: &'static str,
+    confidence: f64,
+}
+
+impl DecisionModel for LabelDecision {
+    fn evaluate(
+        &self,
+        req: DecisionRequest,
+    ) -> BoxFuture<'_, Result<DecisionResponse, HarnessError>> {
+        let top = self.top.to_owned();
+        let confidence = self.confidence;
+        Box::pin(async move {
+            let answers = req
+                .questions
+                .into_keys()
+                .map(|key| {
+                    (
+                        key,
+                        Answer {
+                            probabilities: BTreeMap::from([(top.clone(), confidence)]),
+                            confidence,
+                        },
+                    )
+                })
+                .collect();
+            Ok(DecisionResponse {
+                answers,
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+
+struct CountingGenerate {
+    calls: Arc<AtomicUsize>,
+}
+
+impl GenerativeModel for CountingGenerate {
+    fn complete(&self, _req: GenRequest) -> BoxFuture<'_, Result<GenResponse, HarnessError>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async {
+            Ok(GenResponse {
+                output: GenOutput::Json(json!({ "reply": "ok" })),
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+
+fn ends_at(path: &[NodeId]) -> Option<&str> {
+    path.last().map(|id| id.0.as_str())
+}
+
+#[tokio::test]
+async fn billing_fixture_reaches_billing() {
+    let doc = load(TICKET_ROUTER);
+    let run = Machine::builder()
+        .decision(LabelDecision {
+            top: "billing",
+            confidence: 0.88,
+        })
+        .build()
+        .run_document(&doc, State::new())
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(ends_at(&run.path), Some("billing"));
+}
+
+#[tokio::test]
+async fn low_confidence_takes_the_document_queue_edge() {
+    let doc = load(TICKET_ROUTER);
+    let run = Machine::builder()
+        .decision(LabelDecision {
+            top: "billing",
+            confidence: 0.2,
+        })
+        .build()
+        .run_document(&doc, State::new())
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(ends_at(&run.path), Some("queue"));
+    assert!(!run.path.iter().any(|id| id.0 == "billing"));
+}
+
+#[tokio::test]
+async fn gated_draft_runs_the_model_only_when_the_allow_label_matches() {
+    let doc = load(GATED_DRAFT);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut state = State::new();
+    state.insert("approved".into(), json!(true));
+    state.insert("request".into(), json!("Please refund invoice 1042."));
+
+    let allowed = Machine::builder()
+        .decision(LabelDecision {
+            top: "true",
+            confidence: 0.86,
+        })
+        .generative(CountingGenerate {
+            calls: Arc::clone(&calls),
+        })
+        .build()
+        .run_document(&doc, state.clone())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(
+        allowed
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::Generate)
+    );
+    assert_eq!(ends_at(&allowed.path), Some("accept"));
+
+    calls.store(0, Ordering::SeqCst);
+    let denied = Machine::builder()
+        .decision(LabelDecision {
+            top: "false",
+            confidence: 0.86,
+        })
+        .generative(CountingGenerate {
+            calls: Arc::clone(&calls),
+        })
+        .build()
+        .run_document(&doc, state)
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(
+        !denied
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::Generate)
+    );
+    assert_eq!(ends_at(&denied.path), Some("safe"));
+}
+
+#[tokio::test]
+async fn missing_approval_does_not_visit_draft() {
+    let doc = load(GATED_DRAFT);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut with_request = State::new();
+    with_request.insert("request".into(), json!("Please refund invoice 1042."));
+
+    let missing = Machine::builder()
+        .decision(LabelDecision {
+            top: "true",
+            confidence: 0.86,
+        })
+        .generative(CountingGenerate {
+            calls: Arc::clone(&calls),
+        })
+        .build()
+        .run_document(&doc, with_request.clone())
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!missing.path.iter().any(|id| id.0 == "draft"));
+
+    calls.store(0, Ordering::SeqCst);
+    with_request.insert("approved".into(), json!(false));
+    let denied = Machine::builder()
+        .decision(LabelDecision {
+            top: "true",
+            confidence: 0.86,
+        })
+        .generative(CountingGenerate { calls })
+        .build()
+        .run_document(&doc, with_request)
+        .await
+        .unwrap();
+    assert_eq!(denied.status, RunStatus::Completed);
+    assert_eq!(ends_at(&denied.path), Some("safe"));
+    assert!(!denied.path.iter().any(|id| id.0 == "draft"));
+    assert!(
+        !denied
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::Generate)
     );
 }

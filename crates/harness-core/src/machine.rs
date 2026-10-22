@@ -4,6 +4,7 @@ use std::time::Instant;
 use serde_json::Value;
 
 use crate::decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse};
+use crate::document::{BranchWhen, DocumentNode, WorkflowDocument};
 use crate::effect::{Capability, Effect};
 use crate::error::HarnessError;
 use crate::event::{Event, EventKind, EventLog, Usage, input_hash};
@@ -97,9 +98,9 @@ impl MachineBuilder {
     }
 }
 
-/// Runs a [`Workflow`]. The next node comes from the workflow's transition
-/// function, or from its confidence handlers when a decision is low
-/// confidence; model output is stored as data, never followed.
+/// Runs a [`Workflow`] or a [`WorkflowDocument`]. The next node comes from
+/// the workflow's transition function or the document's edges, or from a
+/// low-confidence handler. Model output is stored as data, never followed.
 pub struct Machine {
     decision: Option<Box<dyn DecisionModel>>,
     stronger_decision: Option<Box<dyn DecisionModel>>,
@@ -160,7 +161,14 @@ impl Machine {
             path.push(current.clone());
 
             let (outcome, low_edge) = self
-                .step(wf, node, &mut state, &decisions, &mut events, &mut trace)
+                .step(
+                    &|id| decide_policy(wf, id),
+                    node,
+                    &mut state,
+                    &decisions,
+                    &mut events,
+                    &mut trace,
+                )
                 .await?;
             match &outcome {
                 Outcome::Decided(answers) => {
@@ -209,11 +217,88 @@ impl Machine {
         }
     }
 
+    /// Runs `doc` from its start node. The document's edges are the transition.
+    ///
+    /// An id that is not a node is a sink: the run pushes it on the path and
+    /// completes. No matching edge also completes the run, so a missing
+    /// `approved` value does not visit a later generate node.
+    pub async fn run_document(
+        &self,
+        doc: &WorkflowDocument,
+        mut state: State,
+    ) -> Result<Run, HarnessError> {
+        let empty = &[][..];
+        let mut trace = Trace {
+            events: empty,
+            next: 0,
+        };
+        let mut decisions = Decisions::new();
+        let mut path = Vec::new();
+        let mut events = EventLog::default();
+        let mut current = doc.start.clone();
+        loop {
+            if path.len() >= self.max_steps {
+                return Err(HarnessError::StepLimit(self.max_steps));
+            }
+            let Some(doc_node) = doc.nodes.iter().find(|node| node.id() == &current) else {
+                path.push(current);
+                return Ok(Run {
+                    state,
+                    path,
+                    events,
+                    status: RunStatus::Completed,
+                });
+            };
+            path.push(current.clone());
+            let node = node_from_document(doc_node);
+            let (outcome, low_edge) = self
+                .step(
+                    &|id| document_policy(doc, id),
+                    &node,
+                    &mut state,
+                    &decisions,
+                    &mut events,
+                    &mut trace,
+                )
+                .await?;
+            record_node_output(&current, &outcome, &mut state, &mut decisions)?;
+
+            if let Some(action) = low_edge {
+                match doc.on_low.get(&action) {
+                    Some(handler) => {
+                        current = handler.clone();
+                        continue;
+                    }
+                    None => {
+                        return Ok(Run {
+                            state,
+                            path,
+                            events,
+                            status: RunStatus::Halted(action),
+                        });
+                    }
+                }
+            }
+
+            match next_edge(doc, &current, &outcome, &state) {
+                Some(next) => current = next,
+                None => {
+                    return Ok(Run {
+                        state,
+                        path,
+                        events,
+                        status: RunStatus::Completed,
+                    });
+                }
+            }
+        }
+    }
+
     /// Runs one node. The second value is the low-confidence edge a `Decide`
     /// node must take instead of the transition, if any.
     async fn step(
         &self,
-        wf: &Workflow,
+        gate_policy: &impl Fn(&NodeId) -> Option<ConfidencePolicy>,
         node: &Node,
         state: &mut State,
         decisions: &Decisions,
@@ -247,7 +332,7 @@ impl Machine {
                 gate,
             } => {
                 if let Some(gate) = gate
-                    && !gate_open(gate, wf, decisions)
+                    && !gate_open(gate, gate_policy(&gate.decide), decisions)
                 {
                     return Ok((Outcome::Skipped, None));
                 }
@@ -490,8 +575,8 @@ fn slice(state: &State, reads: &[String]) -> State {
 
 /// Open only if the gate's Decide node has run, its top answer to `question`
 /// is `allow`, and that answer meets the node's `min_confidence`.
-fn gate_open(gate: &Gate, wf: &Workflow, decisions: &Decisions) -> bool {
-    let Some(Node::Decide { policy, .. }) = wf.node(&gate.decide) else {
+fn gate_open(gate: &Gate, policy: Option<ConfidencePolicy>, decisions: &Decisions) -> bool {
+    let Some(policy) = policy else {
         return false;
     };
     decisions
@@ -500,4 +585,129 @@ fn gate_open(gate: &Gate, wf: &Workflow, decisions: &Decisions) -> bool {
         .is_some_and(|answer| {
             answer.top() == Some(gate.allow.as_str()) && answer.confidence >= policy.min_confidence
         })
+}
+
+fn decide_policy(wf: &Workflow, id: &NodeId) -> Option<ConfidencePolicy> {
+    match wf.node(id) {
+        Some(Node::Decide { policy, .. }) => Some(*policy),
+        _ => None,
+    }
+}
+
+fn document_policy(doc: &WorkflowDocument, id: &NodeId) -> Option<ConfidencePolicy> {
+    doc.nodes.iter().find_map(|node| match node {
+        DocumentNode::Decide {
+            id: decide, policy, ..
+        } if decide == id => Some(*policy),
+        _ => None,
+    })
+}
+
+fn node_from_document(node: &DocumentNode) -> Node {
+    match node {
+        DocumentNode::Decide {
+            id,
+            reads,
+            questions,
+            policy,
+        } => Node::Decide {
+            id: id.clone(),
+            reads: reads.clone(),
+            questions: questions.clone(),
+            policy: *policy,
+        },
+        DocumentNode::Generate {
+            id,
+            task,
+            reads,
+            output,
+            max_tokens,
+            gate,
+        } => Node::Generate {
+            id: id.clone(),
+            task: task.clone(),
+            reads: reads.clone(),
+            output: output.clone(),
+            max_tokens: *max_tokens,
+            gate: gate.clone(),
+        },
+        DocumentNode::Effect { id, name, reads } => Node::Effect {
+            id: id.clone(),
+            name: name.clone(),
+            reads: reads.clone(),
+        },
+    }
+}
+
+fn record_node_output(
+    current: &NodeId,
+    outcome: &Outcome,
+    state: &mut State,
+    decisions: &mut Decisions,
+) -> Result<(), HarnessError> {
+    match outcome {
+        Outcome::Decided(answers) => {
+            let value = serde_json::to_value(answers)
+                .map_err(|err| HarnessError::Provider(err.to_string()))?;
+            state.insert(current.0.clone(), value);
+            decisions.insert(current.clone(), answers.clone());
+        }
+        Outcome::Generated(output) => {
+            state.insert(current.0.clone(), stored_gen(output));
+        }
+        Outcome::Effected(value) => {
+            state.insert(current.0.clone(), value.clone());
+        }
+        Outcome::Done | Outcome::Skipped => {}
+    }
+    Ok(())
+}
+
+fn next_edge(
+    doc: &WorkflowDocument,
+    from: &NodeId,
+    outcome: &Outcome,
+    state: &State,
+) -> Option<NodeId> {
+    doc.edges
+        .iter()
+        .find(|edge| &edge.from == from && when_matches(&edge.when, from, doc, outcome, state))
+        .map(|edge| edge.to.clone())
+}
+
+fn when_matches(
+    when: &BranchWhen,
+    from: &NodeId,
+    doc: &WorkflowDocument,
+    outcome: &Outcome,
+    state: &State,
+) -> bool {
+    match when {
+        BranchWhen::Always => true,
+        BranchWhen::Label { question, equals } => answer_top(outcome, question) == Some(equals),
+        BranchWhen::Other { question } => {
+            let Some(top) = answer_top(outcome, question) else {
+                return false;
+            };
+            !doc.edges.iter().any(|edge| {
+                &edge.from == from
+                    && matches!(
+                        &edge.when,
+                        BranchWhen::Label { question: q, equals } if q == question && equals == top
+                    )
+            })
+        }
+        BranchWhen::Generated => matches!(outcome, Outcome::Generated(_)),
+        BranchWhen::Skipped => matches!(outcome, Outcome::Skipped),
+        BranchWhen::State { key, equals } => {
+            state.get(key).and_then(Value::as_bool) == Some(*equals)
+        }
+    }
+}
+
+fn answer_top<'a>(outcome: &'a Outcome, question: &str) -> Option<&'a str> {
+    match outcome {
+        Outcome::Decided(answers) => answers.get(question).and_then(Answer::top),
+        _ => None,
+    }
 }
