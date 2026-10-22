@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use harness_core::{
     Answer, BoxFuture, BranchEdge, BranchWhen, Capability, ConfidenceAction, ConfidencePolicy,
     DecisionModel, DecisionRequest, DecisionResponse, DocumentNode, Effect, EventKind, Gate,
-    GenOutput, GenRequest, GenResponse, GenerativeModel, HarnessError, JsonSchema, Machine, NodeId,
-    OutputSpec, Question, RiskTier, RunStatus, State, Usage, WorkflowDocument,
+    GateOutcome, GenOutput, GenRequest, GenResponse, GenerativeModel, GrantDecision, HarnessError,
+    JsonSchema, Machine, NodeId, OutputSpec, Question, RiskTier, RunStatus, State, Usage,
+    WorkflowDocument, read_run,
 };
 use serde_json::{Value, json};
 
@@ -699,6 +700,15 @@ async fn a_read_effect_runs_when_the_grant_is_present() {
             .iter()
             .any(|event| event.kind == EventKind::Effect)
     );
+    assert_eq!(
+        run.events.grants(),
+        &[GrantDecision {
+            owner: "fixture".into(),
+            tier: RiskTier::Read,
+            tool: "file_read".into(),
+            gate: GateOutcome::NotRequired,
+        }]
+    );
     assert_eq!(ends_at(&run.path), Some("read"));
 }
 
@@ -728,6 +738,7 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .iter()
             .all(|event| event.kind != EventKind::Effect)
     );
+    assert_eq!(held.events.grants(), &[skipped_grant()]);
     assert_eq!(ends_at(&held.path), Some("held"));
 
     let mut waiting = granted_read(
@@ -768,6 +779,7 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .iter()
             .all(|event| event.kind != EventKind::Effect)
     );
+    assert_eq!(denied.events.grants(), &[skipped_grant()]);
     assert_eq!(ends_at(&denied.path), Some("held"));
 
     let (calls, effect) = counting("file_read", Capability::FileRead);
@@ -789,7 +801,59 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .iter()
             .any(|event| event.kind == EventKind::Effect)
     );
+    assert_eq!(
+        allowed.events.grants(),
+        &[GrantDecision {
+            owner: "fixture".into(),
+            tier: RiskTier::Write,
+            tool: "file_read".into(),
+            gate: GateOutcome::Passed,
+        }]
+    );
     assert_eq!(ends_at(&allowed.path), Some("read"));
+}
+
+fn skipped_grant() -> GrantDecision {
+    GrantDecision {
+        owner: "fixture".into(),
+        tier: RiskTier::Write,
+        tool: "file_read".into(),
+        gate: GateOutcome::Skipped,
+    }
+}
+
+#[tokio::test]
+async fn a_grant_decision_appends_without_a_credential() {
+    let doc = granted_read(RiskTier::Read, vec![file_read_node()], vec![]);
+    let (_calls, effect) = counting("file_read", Capability::FileRead);
+    let run = Machine::builder()
+        .effect(effect)
+        .grant(Capability::FileRead)
+        .build()
+        .run_document(&doc, State::new())
+        .await
+        .unwrap();
+    let path = std::env::temp_dir().join(format!("seaotter-grant-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let id = run.events.append_to(&path, "document", "user-7").unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\"owner\":\"fixture\""), "{text}");
+    assert!(text.contains("\"tier\":\"read\""), "{text}");
+    assert!(text.contains("\"tool\":\"file_read\""), "{text}");
+    assert!(text.contains("\"gate\":\"not_required\""), "{text}");
+    for key in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "TYPESAFE_API_KEY",
+        "COMPOSIO_API_KEY",
+        "host_permission",
+    ] {
+        assert!(!text.contains(key), "{key} in {text}");
+    }
+    let read = read_run(&path, &id).unwrap();
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0].kind, EventKind::Effect);
+    std::fs::remove_file(&path).unwrap();
 }
 
 #[tokio::test]
