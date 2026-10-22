@@ -1,4 +1,7 @@
 {
+  "owner": "fixture",
+  "tier": "read",
+  "grants": [],
   "start": "classify",
   "nodes": [
     {
