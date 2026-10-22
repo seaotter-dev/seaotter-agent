@@ -39,7 +39,7 @@ pub use decision::{
     Question,
 };
 pub use diff::{Divergence, diff_runs};
-pub use document::{BranchEdge, BranchWhen, DocumentNode, WorkflowDocument};
+pub use document::{BranchEdge, BranchWhen, DocumentNode, RiskTier, WorkflowDocument};
 pub use effect::{Capability, Effect};
 pub use error::HarnessError;
 pub use eval::{FixtureError, check_answer_fixture, check_branch_fixture};

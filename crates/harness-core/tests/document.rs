@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6,7 +6,7 @@ use harness_core::{
     Answer, BoxFuture, BranchEdge, BranchWhen, ConfidenceAction, ConfidencePolicy, DecisionModel,
     DecisionRequest, DecisionResponse, DocumentNode, EventKind, Gate, GenOutput, GenRequest,
     GenResponse, GenerativeModel, HarnessError, JsonSchema, Machine, NodeId, OutputSpec, Question,
-    RunStatus, State, Usage, WorkflowDocument,
+    RiskTier, RunStatus, State, Usage, WorkflowDocument,
 };
 use serde_json::json;
 
@@ -16,6 +16,9 @@ const GATED_DRAFT: &str = include_str!("../fixtures/gated-draft.json");
 fn load(json: &str) -> WorkflowDocument {
     let doc: WorkflowDocument = serde_json::from_str(json).unwrap();
     let rebuilt = WorkflowDocument::new(
+        doc.owner.clone(),
+        doc.tier,
+        doc.grants.clone(),
         doc.start.clone(),
         doc.nodes.clone(),
         doc.edges.clone(),
@@ -27,6 +30,23 @@ fn load(json: &str) -> WorkflowDocument {
     let again: WorkflowDocument = serde_json::from_str(&encoded).unwrap();
     assert_eq!(doc, again);
     doc
+}
+
+fn opened(
+    start: impl Into<NodeId>,
+    nodes: Vec<DocumentNode>,
+    edges: Vec<BranchEdge>,
+    on_low: BTreeMap<ConfidenceAction, NodeId>,
+) -> Result<WorkflowDocument, HarnessError> {
+    WorkflowDocument::new(
+        "fixture",
+        RiskTier::Read,
+        BTreeSet::<String>::new(),
+        start.into(),
+        nodes,
+        edges,
+        on_low,
+    )
 }
 
 fn decide(id: &str) -> DocumentNode {
@@ -144,6 +164,9 @@ fn gated_draft_fixture_round_trips() {
 #[test]
 fn effect_edge_round_trips() {
     let doc = WorkflowDocument::new(
+        "fixture",
+        RiskTier::Read,
+        ["file_read"],
         "read".into(),
         vec![DocumentNode::Effect {
             id: "read".into(),
@@ -174,6 +197,9 @@ fn effect_edge_round_trips() {
 #[test]
 fn a_step_field_fails_to_deserialize() {
     let json = r#"{
+        "owner": "fixture",
+        "tier": "read",
+        "grants": [],
         "start": "classify",
         "nodes": [{
             "kind": "decide",
@@ -191,8 +217,8 @@ fn a_step_field_fails_to_deserialize() {
 
 #[test]
 fn new_rejects_a_document_the_machine_cannot_load() {
-    let duplicate = WorkflowDocument::new(
-        "classify".into(),
+    let duplicate = opened(
+        "classify",
         vec![decide("classify"), decide("classify")],
         vec![],
         BTreeMap::new(),
@@ -204,12 +230,7 @@ fn new_rejects_a_document_the_machine_cannot_load() {
         ))
     );
 
-    let missing = WorkflowDocument::new(
-        "missing".into(),
-        vec![decide("classify")],
-        vec![],
-        BTreeMap::new(),
-    );
+    let missing = opened("missing", vec![decide("classify")], vec![], BTreeMap::new());
     assert_eq!(
         missing,
         Err(HarnessError::Workflow(
@@ -217,8 +238,8 @@ fn new_rejects_a_document_the_machine_cannot_load() {
         ))
     );
 
-    let gate = WorkflowDocument::new(
-        "draft".into(),
+    let gate = opened(
+        "draft",
         vec![DocumentNode::Generate {
             id: "draft".into(),
             task: "Draft.".into(),
@@ -241,8 +262,8 @@ fn new_rejects_a_document_the_machine_cannot_load() {
         ))
     );
 
-    let edge = WorkflowDocument::new(
-        "classify".into(),
+    let edge = opened(
+        "classify",
         vec![decide("classify")],
         vec![BranchEdge {
             from: "billing".into(),
@@ -260,13 +281,148 @@ fn new_rejects_a_document_the_machine_cannot_load() {
 
     let mut on_low = BTreeMap::new();
     on_low.insert(ConfidenceAction::Continue, "queue".into());
-    let low = WorkflowDocument::new("classify".into(), vec![decide("classify")], vec![], on_low);
+    let low = opened("classify", vec![decide("classify")], vec![], on_low);
     assert_eq!(
         low,
         Err(HarnessError::Workflow(
             "Continue is not a low-confidence edge".into()
         ))
     );
+}
+
+#[test]
+fn a_document_without_an_owner_or_a_known_tier_fails_to_load() {
+    let missing = r#"{
+        "tier": "read",
+        "grants": [],
+        "start": "classify",
+        "nodes": [{
+            "kind": "decide",
+            "id": "classify",
+            "reads": [],
+            "questions": {},
+            "policy": { "min_confidence": 0.7, "on_low": "safe_default" }
+        }],
+        "edges": []
+    }"#;
+    assert!(serde_json::from_str::<WorkflowDocument>(missing).is_err());
+    assert_eq!(
+        opened(
+            "classify",
+            vec![decide("classify")],
+            vec![],
+            BTreeMap::new()
+        )
+        .map(|doc| doc.owner),
+        Ok("fixture".to_owned())
+    );
+    assert_eq!(
+        WorkflowDocument::new(
+            "   ",
+            RiskTier::Read,
+            BTreeSet::<String>::new(),
+            "classify".into(),
+            vec![decide("classify")],
+            vec![],
+            BTreeMap::new(),
+        ),
+        Err(HarnessError::Workflow("document has no owner".into()))
+    );
+    for tier in ["dangerous", "shell"] {
+        let json = format!(
+            r#"{{"owner":"fixture","tier":{tier:?},"grants":[],"start":"classify","nodes":[{{"kind":"decide","id":"classify","reads":[],"questions":{{}},"policy":{{"min_confidence":0.7,"on_low":"safe_default"}}}}],"edges":[]}}"#
+        );
+        let err = serde_json::from_str::<WorkflowDocument>(&json).unwrap_err();
+        assert!(err.to_string().contains(tier), "{err}");
+    }
+}
+
+#[test]
+fn shell_and_dangerous_effects_fail_even_with_a_grant() {
+    for name in ["shell", "dangerous"] {
+        let loaded = WorkflowDocument::new(
+            "fixture",
+            RiskTier::Write,
+            [name],
+            "run".into(),
+            vec![DocumentNode::Effect {
+                id: "run".into(),
+                name: name.into(),
+                reads: vec![],
+            }],
+            vec![],
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            loaded,
+            Err(HarnessError::Workflow(format!(
+                "effect `{name}` cannot be loaded"
+            )))
+        );
+        let json = format!(
+            r#"{{"owner":"fixture","tier":"write","grants":[{name:?}],"start":"run","nodes":[{{"kind":"effect","id":"run","name":{name:?},"reads":[]}}],"edges":[]}}"#
+        );
+        let err = serde_json::from_str::<WorkflowDocument>(&json).unwrap_err();
+        assert!(err.to_string().contains("cannot be loaded"), "{err}");
+    }
+}
+
+#[test]
+fn an_effect_requires_its_grant() {
+    let node = DocumentNode::Effect {
+        id: "read".into(),
+        name: "file_read".into(),
+        reads: vec![],
+    };
+    let missing = WorkflowDocument::new(
+        "fixture",
+        RiskTier::Read,
+        BTreeSet::<String>::new(),
+        "read".into(),
+        vec![node.clone()],
+        vec![],
+        BTreeMap::new(),
+    );
+    assert_eq!(
+        missing,
+        Err(HarnessError::Workflow(
+            "effect `file_read` has no grant".into()
+        ))
+    );
+    let granted = WorkflowDocument::new(
+        "fixture",
+        RiskTier::Read,
+        ["file_read"],
+        "read".into(),
+        vec![node],
+        vec![],
+        BTreeMap::new(),
+    )
+    .unwrap();
+    let again: WorkflowDocument =
+        serde_json::from_str(&serde_json::to_string(&granted).unwrap()).unwrap();
+    assert_eq!(granted, again);
+}
+
+#[test]
+fn a_document_stores_no_api_key() {
+    let encoded = serde_json::to_string(&load(TICKET_ROUTER)).unwrap();
+    for key in [
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "TYPESAFE_API_KEY",
+        "COMPOSIO_API_KEY",
+    ] {
+        assert!(!TICKET_ROUTER.contains(key), "{key}");
+        assert!(!GATED_DRAFT.contains(key), "{key}");
+        assert!(!encoded.contains(key), "{key}");
+        let with_key =
+            TICKET_ROUTER.replacen("\"start\"", &format!("\"{key}\": \"secret\", \"start\""), 1);
+        assert!(
+            serde_json::from_str::<WorkflowDocument>(&with_key).is_err(),
+            "{key}"
+        );
+    }
 }
 
 struct LabelDecision {
