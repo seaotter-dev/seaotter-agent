@@ -18,5 +18,8 @@ pub enum Capability {
 pub trait Effect: Send + Sync {
     fn name(&self) -> &str;
     fn capability(&self) -> Capability;
+    fn provider(&self) -> &str {
+        self.name()
+    }
     fn run(&self, input: Value) -> BoxFuture<'_, Result<Value, HarnessError>>;
 }

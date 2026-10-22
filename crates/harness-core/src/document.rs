@@ -155,7 +155,7 @@ impl WorkflowDocument {
                 ..
             } = node
             {
-                if name == "shell" || name == "dangerous" {
+                if name == "shell" || name == "dangerous" || name == "platform" {
                     return Err(HarnessError::Workflow(format!(
                         "effect `{name}` cannot be loaded"
                     )));
