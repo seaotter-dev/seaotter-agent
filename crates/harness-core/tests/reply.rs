@@ -68,7 +68,7 @@ async fn a_recorded_reply_becomes_a_document_and_the_run_does_not_build() {
             confidence: 0.88,
         })
         .build()
-        .run_document(&doc, State::new())
+        .run_document(&doc, State::new(), None)
         .await
         .unwrap();
     assert_eq!(run.status, RunStatus::Completed);

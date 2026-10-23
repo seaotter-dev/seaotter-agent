@@ -88,7 +88,7 @@ impl Server {
         let doc = self.load_workflow()?;
         Machine::builder()
             .build()
-            .run_document(&doc, State::new())
+            .run_document(&doc, State::new(), None)
             .await
     }
 
@@ -100,7 +100,7 @@ impl Server {
         Machine::builder()
             .decision(decision)
             .build()
-            .run_document(&doc, State::new())
+            .run_document(&doc, State::new(), None)
             .await
     }
 

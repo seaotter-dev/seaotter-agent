@@ -4,10 +4,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use harness_core::{
     Answer, BoxFuture, BranchEdge, BranchWhen, Capability, ConfidenceAction, ConfidencePolicy,
-    DecisionModel, DecisionRequest, DecisionResponse, DocumentNode, Effect, EventKind, Gate,
-    GateOutcome, GenOutput, GenRequest, GenResponse, GenerativeModel, GrantDecision, HarnessError,
-    JsonSchema, Machine, NodeId, OutputSpec, Question, RiskTier, RunStatus, State, Usage,
-    WorkflowDocument, read_run,
+    DecisionModel, DecisionRequest, DecisionResponse, DocumentNode, DriftThresholds, Effect,
+    EventKind, Gate, GateOutcome, GenOutput, GenRequest, GenResponse, GenerativeModel,
+    GrantDecision, HarnessError, JsonSchema, Machine, NodeId, OutputSpec, Question, RiskTier,
+    RunStatus, State, Usage, WorkflowDocument, load_baseline, read_run,
 };
 use serde_json::{Value, json};
 
@@ -495,7 +495,7 @@ async fn billing_fixture_reaches_billing() {
             confidence: 0.88,
         })
         .build()
-        .run_document(&doc, State::new())
+        .run_document(&doc, State::new(), None)
         .await
         .unwrap();
     assert_eq!(run.status, RunStatus::Completed);
@@ -511,16 +511,19 @@ async fn low_confidence_takes_the_document_queue_edge() {
             confidence: 0.2,
         })
         .build()
-        .run_document(&doc, State::new())
+        .run_document(&doc, State::new(), None)
         .await
         .unwrap();
     assert_eq!(run.status, RunStatus::Completed);
     assert_eq!(ends_at(&run.path), Some("queue"));
     assert!(!run.path.iter().any(|id| id.0 == "billing"));
-    assert_eq!(run.events.signals().len(), 1);
+    assert_eq!(run.events.signals().len(), 2);
     assert_eq!(run.events.signals()[0].check, "confidence_low");
     assert_eq!(run.events.signals()[0].node, "classify".into());
     assert_eq!(run.events.signals()[0].finding, "safe_default");
+    assert_eq!(run.events.signals()[1].check, "baseline_missing");
+    assert_eq!(run.events.signals()[1].node, "queue".into());
+    assert_eq!(run.events.signals()[1].finding, "no prior runs");
 }
 
 #[tokio::test]
@@ -540,7 +543,7 @@ async fn gated_draft_runs_the_model_only_when_the_allow_label_matches() {
             calls: Arc::clone(&calls),
         })
         .build()
-        .run_document(&doc, state.clone())
+        .run_document(&doc, state.clone(), None)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -562,7 +565,7 @@ async fn gated_draft_runs_the_model_only_when_the_allow_label_matches() {
             calls: Arc::clone(&calls),
         })
         .build()
-        .run_document(&doc, state)
+        .run_document(&doc, state, None)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -591,7 +594,7 @@ async fn missing_approval_does_not_visit_draft() {
             calls: Arc::clone(&calls),
         })
         .build()
-        .run_document(&doc, with_request.clone())
+        .run_document(&doc, with_request.clone(), None)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -606,7 +609,7 @@ async fn missing_approval_does_not_visit_draft() {
         })
         .generative(CountingGenerate { calls })
         .build()
-        .run_document(&doc, with_request)
+        .run_document(&doc, with_request, None)
         .await
         .unwrap();
     assert_eq!(denied.status, RunStatus::Completed);
@@ -703,7 +706,7 @@ async fn a_read_effect_runs_when_the_grant_is_present() {
         .effect(effect)
         .grant(Capability::FileRead)
         .build()
-        .run_document(&doc, State::new())
+        .run_document(&doc, State::new(), None)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -741,7 +744,7 @@ async fn a_write_effect_waits_for_the_human_gate() {
         .effect(effect)
         .grant(Capability::FileRead)
         .build()
-        .run_document(&closed, State::new())
+        .run_document(&closed, State::new(), None)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -751,10 +754,13 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .all(|event| event.kind != EventKind::Effect)
     );
     assert_eq!(held.events.grants(), &[skipped_grant()]);
-    assert_eq!(held.events.signals().len(), 1);
+    assert_eq!(held.events.signals().len(), 2);
     assert_eq!(held.events.signals()[0].check, "write_skipped");
     assert_eq!(held.events.signals()[0].node, "read".into());
     assert_eq!(held.events.signals()[0].finding, "file_read");
+    assert_eq!(held.events.signals()[1].check, "baseline_missing");
+    assert_eq!(held.events.signals()[1].node, "held".into());
+    assert_eq!(held.events.signals()[1].finding, "no prior runs");
     assert_eq!(ends_at(&held.path), Some("held"));
 
     let mut waiting = granted_read(
@@ -785,7 +791,7 @@ async fn a_write_effect_waits_for_the_human_gate() {
         .effect(effect)
         .grant(Capability::FileRead)
         .build()
-        .run_document(&waiting, State::new())
+        .run_document(&waiting, State::new(), None)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
@@ -796,8 +802,11 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .all(|event| event.kind != EventKind::Effect)
     );
     assert_eq!(denied.events.grants(), &[skipped_grant()]);
-    assert_eq!(denied.events.signals().len(), 1);
+    assert_eq!(denied.events.signals().len(), 2);
     assert_eq!(denied.events.signals()[0].check, "write_skipped");
+    assert_eq!(denied.events.signals()[1].check, "baseline_missing");
+    assert_eq!(denied.events.signals()[1].node, "held".into());
+    assert_eq!(denied.events.signals()[1].finding, "no prior runs");
     assert_eq!(ends_at(&denied.path), Some("held"));
 
     let (calls, effect) = counting("file_read", Capability::FileRead);
@@ -809,7 +818,7 @@ async fn a_write_effect_waits_for_the_human_gate() {
         .effect(effect)
         .grant(Capability::FileRead)
         .build()
-        .run_document(&waiting, State::new())
+        .run_document(&waiting, State::new(), None)
         .await
         .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -819,7 +828,13 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .iter()
             .any(|event| event.kind == EventKind::Effect)
     );
-    assert!(allowed.events.signals().is_empty());
+    assert_eq!(allowed.events.signals().len(), 1);
+    assert_eq!(allowed.events.signals()[0].check, "baseline_missing");
+    assert_eq!(
+        allowed.events.signals()[0].node,
+        ends_at(&allowed.path).unwrap().into()
+    );
+    assert_eq!(allowed.events.signals()[0].finding, "no prior runs");
     assert_eq!(
         allowed.events.grants(),
         &[GrantDecision {
@@ -849,7 +864,7 @@ async fn a_grant_decision_appends_without_a_credential() {
         .effect(effect)
         .grant(Capability::FileRead)
         .build()
-        .run_document(&doc, State::new())
+        .run_document(&doc, State::new(), None)
         .await
         .unwrap();
     let path = std::env::temp_dir().join(format!("seaotter-grant-{}", std::process::id()));
@@ -899,7 +914,7 @@ async fn a_dangerous_effect_cannot_run() {
             .effect(effect)
             .grant(Capability::FileRead)
             .build()
-            .run_document(&doc, State::new())
+            .run_document(&doc, State::new(), None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -915,7 +930,7 @@ async fn a_dangerous_effect_cannot_run() {
         .effect(effect)
         .grant(Capability::DangerousShell)
         .build()
-        .run_document(&doc, State::new())
+        .run_document(&doc, State::new(), None)
         .await
         .unwrap_err();
     assert_eq!(
@@ -955,4 +970,131 @@ fn a_human_gate_must_point_at_a_decide_node() {
             .contains("human gate must point at a Decide node"),
         "{loaded}"
     );
+}
+
+fn strict_thresholds() -> DriftThresholds {
+    DriftThresholds {
+        branch_match: 1.0,
+        confidence_delta: 0.0,
+        output_match: 1.0,
+    }
+}
+
+fn router(top: &'static str, confidence: f64) -> Machine {
+    Machine::builder()
+        .decision(LabelDecision { top, confidence })
+        .build()
+}
+
+async fn billing_baseline(
+    name: &str,
+    confidence: f64,
+) -> (harness_core::Baseline, std::path::PathBuf) {
+    let doc = load(TICKET_ROUTER);
+    let run = router("billing", confidence)
+        .run_document(&doc, State::new(), None)
+        .await
+        .unwrap();
+    let path =
+        std::env::temp_dir().join(format!("seaotter-run-checks-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    run.events.append_to(&path, "ticket", "user-7").unwrap();
+    let baseline = load_baseline(&path, "ticket", "current-run").unwrap();
+    (baseline, path)
+}
+
+#[tokio::test]
+async fn a_matching_run_adds_no_drift_or_anomaly() {
+    let doc = load(TICKET_ROUTER);
+    let (baseline, path) = billing_baseline("matching", 0.88).await;
+    let thresholds = strict_thresholds();
+    let run = router("billing", 0.88)
+        .run_document(&doc, State::new(), Some((&baseline, &thresholds)))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(ends_at(&run.path), Some("billing"));
+    assert!(run.events.signals().is_empty());
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[tokio::test]
+async fn a_different_output_records_drift_and_keeps_the_path() {
+    let doc = load(TICKET_ROUTER);
+    let (baseline, path) = billing_baseline("drifted", 0.88).await;
+    let thresholds = strict_thresholds();
+    let run = router("technical", 0.88)
+        .run_document(&doc, State::new(), Some((&baseline, &thresholds)))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(ends_at(&run.path), Some("technical"));
+    assert_eq!(run.events.signals().len(), 1);
+    assert_eq!(run.events.signals()[0].check, "drift_output");
+    assert_eq!(run.events.signals()[0].node, "classify".into());
+    assert_eq!(run.events.signals()[0].finding, "output");
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[tokio::test]
+async fn a_confidence_below_the_baseline_records_an_anomaly_and_finishes() {
+    let doc = load(TICKET_ROUTER);
+    let (baseline, path) = billing_baseline("anomaly", 0.9).await;
+    let thresholds = DriftThresholds {
+        branch_match: 1.0,
+        confidence_delta: 1.0,
+        output_match: 0.0,
+    };
+    let run = router("billing", 0.5)
+        .run_document(&doc, State::new(), Some((&baseline, &thresholds)))
+        .await
+        .unwrap();
+    assert_eq!(run.status, RunStatus::Completed);
+    assert_eq!(ends_at(&run.path), Some("queue"));
+    assert!(
+        run.events
+            .signals()
+            .iter()
+            .any(|signal| signal.check == "anomaly_confidence" && signal.node == "classify".into())
+    );
+    assert!(
+        run.events
+            .signals()
+            .iter()
+            .all(|signal| !signal.check.starts_with("drift_"))
+    );
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[tokio::test]
+async fn a_missing_baseline_records_one_signal() {
+    let doc = load(TICKET_ROUTER);
+    let absent = router("billing", 0.88)
+        .run_document(&doc, State::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(absent.status, RunStatus::Completed);
+    assert_eq!(ends_at(&absent.path), Some("billing"));
+    assert_eq!(absent.events.signals().len(), 1);
+    assert_eq!(absent.events.signals()[0].check, "baseline_missing");
+    assert_eq!(absent.events.signals()[0].node, "billing".into());
+    assert_eq!(absent.events.signals()[0].finding, "no prior runs");
+
+    let missing = std::env::temp_dir().join(format!(
+        "seaotter-run-checks-missing-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&missing);
+    let baseline = load_baseline(&missing, "ticket", "absent").unwrap();
+    let thresholds = strict_thresholds();
+    let empty = router("billing", 0.88)
+        .run_document(&doc, State::new(), Some((&baseline, &thresholds)))
+        .await
+        .unwrap();
+    assert_eq!(empty.status, RunStatus::Completed);
+    assert_eq!(ends_at(&empty.path), Some("billing"));
+    assert_eq!(empty.events.signals().len(), 1);
+    assert_eq!(empty.events.signals()[0].check, "baseline_missing");
+    assert_eq!(empty.events.signals()[0].node, "billing".into());
+    assert_eq!(empty.events.signals()[0].finding, "no prior runs");
 }

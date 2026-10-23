@@ -101,7 +101,7 @@ async fn an_action_outside_the_grant_makes_no_request() {
         .grant(Capability::Composio)
         .grant(Capability::FileRead)
         .build()
-        .run_document(&doc, State::new())
+        .run_document(&doc, State::new(), None)
         .await
         .unwrap_err();
     assert_eq!(
@@ -150,7 +150,7 @@ async fn a_platform_provider_does_not_run() {
         })
         .grant(Capability::Composio)
         .build()
-        .run_document(&document(), State::new())
+        .run_document(&document(), State::new(), None)
         .await
         .unwrap_err();
     assert_eq!(
@@ -173,7 +173,7 @@ async fn the_gates_return_before_composio_reads_a_key() {
         )
         .grant(Capability::Composio)
         .build()
-        .run_document(&doc, State::new())
+        .run_document(&doc, State::new(), None)
         .await
         .unwrap_err();
     assert_eq!(err, HarnessError::Workflow("document has no owner".into()));
@@ -189,7 +189,7 @@ async fn the_gates_return_before_composio_reads_a_key() {
         )
         .grant(Capability::Composio)
         .build()
-        .run_document(&closed_write(), State::new())
+        .run_document(&closed_write(), State::new(), None)
         .await
         .unwrap();
     assert_eq!(run.events.grants()[0].gate, GateOutcome::Skipped);
@@ -248,7 +248,11 @@ async fn a_missing_key_fails_before_any_request() {
         .grant(Capability::Composio)
         .grant(Capability::FileRead)
         .build()
-        .run_document(&document(), State::from([("draft".into(), json!("hello"))]))
+        .run_document(
+            &document(),
+            State::from([("draft".into(), json!("hello"))]),
+            None,
+        )
         .await
         .unwrap_err();
     assert_eq!(
