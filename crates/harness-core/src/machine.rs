@@ -3,8 +3,10 @@ use std::time::Instant;
 
 use serde_json::Value;
 
+use crate::anomaly::anomaly;
 use crate::decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse};
 use crate::document::{BranchWhen, DocumentNode, RiskTier, WorkflowDocument};
+use crate::drift::{Baseline, DriftThresholds};
 use crate::effect::{Capability, Effect};
 use crate::error::HarnessError;
 use crate::event::{
@@ -226,10 +228,14 @@ impl Machine {
     /// `approved` value does not visit a later generate node. A write-tier
     /// effect is skipped until `human_gate` passes. An effect named `shell`
     /// or `dangerous`, or one whose capability is `DangerousShell`, does not run.
+    ///
+    /// `checks` records drift and anomaly after the path finishes. `None` and
+    /// an empty baseline record one `baseline_missing` signal and no other finding.
     pub async fn run_document(
         &self,
         doc: &WorkflowDocument,
         mut state: State,
+        checks: Option<(&Baseline, &DriftThresholds)>,
     ) -> Result<Run, HarnessError> {
         let empty = &[][..];
         let mut trace = Trace {
@@ -246,6 +252,7 @@ impl Machine {
             }
             let Some(doc_node) = doc.nodes.iter().find(|node| node.id() == &current) else {
                 path.push(current);
+                record_run_checks(&mut events, &path, checks);
                 return Ok(Run {
                     state,
                     path,
@@ -290,6 +297,7 @@ impl Machine {
                         continue;
                     }
                     None => {
+                        record_run_checks(&mut events, &path, checks);
                         return Ok(Run {
                             state,
                             path,
@@ -303,6 +311,7 @@ impl Machine {
             match next_edge(doc, &current, &outcome, &state) {
                 Some(next) => current = next,
                 None => {
+                    record_run_checks(&mut events, &path, checks);
                     return Ok(Run {
                         state,
                         path,
@@ -606,6 +615,35 @@ impl Machine {
                 Ok((answers, Some(action)))
             }
         }
+    }
+}
+
+fn record_run_checks(
+    events: &mut EventLog,
+    path: &[NodeId],
+    checks: Option<(&Baseline, &DriftThresholds)>,
+) {
+    let Some(node) = path.last() else {
+        return;
+    };
+    let found = match checks {
+        None => vec![Signal {
+            check: "baseline_missing".into(),
+            node: node.clone(),
+            finding: "no prior runs".into(),
+        }],
+        Some((baseline, thresholds)) => {
+            if let Some(signal) = baseline.missing_signal(node) {
+                vec![signal]
+            } else {
+                let mut found = baseline.drift(events.as_slice(), thresholds);
+                found.extend(anomaly(baseline, events.as_slice()));
+                found
+            }
+        }
+    };
+    for signal in found {
+        events.push_signal(signal);
     }
 }
 
