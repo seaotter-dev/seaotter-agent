@@ -7,7 +7,9 @@ use crate::decision::{Answer, DecisionModel, DecisionRequest, DecisionResponse};
 use crate::document::{BranchWhen, DocumentNode, RiskTier, WorkflowDocument};
 use crate::effect::{Capability, Effect};
 use crate::error::HarnessError;
-use crate::event::{Event, EventKind, EventLog, GateOutcome, GrantDecision, Usage, input_hash};
+use crate::event::{
+    Event, EventKind, EventLog, GateOutcome, GrantDecision, Signal, Usage, input_hash,
+};
 use crate::generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, OutputSpec};
 use crate::node::{Gate, Node, NodeId};
 use crate::policy::{ConfidenceAction, ConfidencePolicy};
@@ -388,6 +390,11 @@ impl Machine {
             gate,
         });
         if doc.tier == RiskTier::Write && !gate_passed {
+            events.push_signal(Signal {
+                check: "write_skipped".into(),
+                node: node.id().clone(),
+                finding: name.to_owned(),
+            });
             return Ok((Outcome::Skipped, None));
         }
         if name == "composio"
@@ -471,7 +478,16 @@ impl Machine {
                     })?;
                     model.complete(req.clone()).await?
                 };
-                validate_output(output, &resp.output)?;
+                if let Err(err) = validate_output(output, &resp.output) {
+                    if matches!(err, HarnessError::SchemaInvalid(_)) {
+                        events.push_signal(Signal {
+                            check: "schema_invalid".into(),
+                            node: id.clone(),
+                            finding: err.to_string(),
+                        });
+                    }
+                    return Err(err);
+                }
                 events.push(Event {
                     node: id.clone(),
                     name: id.0.clone(),
@@ -581,12 +597,31 @@ impl Machine {
                 if confidence(&answers) >= policy.min_confidence {
                     Ok((answers, None))
                 } else {
+                    record_low_confidence(events, node, ConfidenceAction::Escalate);
                     Ok((answers, Some(ConfidenceAction::Escalate)))
                 }
             }
-            (action, _) => Ok((answers, Some(action))),
+            (action, _) => {
+                record_low_confidence(events, node, action);
+                Ok((answers, Some(action)))
+            }
         }
     }
+}
+
+fn record_low_confidence(events: &mut EventLog, node: &NodeId, action: ConfidenceAction) {
+    events.push_signal(Signal {
+        check: "confidence_low".into(),
+        node: node.clone(),
+        finding: match action {
+            ConfidenceAction::Escalate => "escalate",
+            ConfidenceAction::RetryStronger => "retry_stronger",
+            ConfidenceAction::SafeDefault => "safe_default",
+            ConfidenceAction::Human => "human",
+            ConfidenceAction::Continue => "continue",
+        }
+        .to_owned(),
+    });
 }
 
 struct Trace<'a> {
@@ -847,5 +882,80 @@ fn answer_top<'a>(outcome: &'a Outcome, question: &str) -> Option<&'a str> {
     match outcome {
         Outcome::Decided(answers) => answers.get(question).and_then(Answer::top),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::future::BoxFuture;
+    use crate::generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, JsonSchema};
+    use crate::workflow::{Next, Workflow};
+    use serde_json::json;
+
+    struct TextGen;
+
+    impl GenerativeModel for TextGen {
+        fn complete(&self, _req: GenRequest) -> BoxFuture<'_, Result<GenResponse, HarnessError>> {
+            Box::pin(async {
+                Ok(GenResponse {
+                    output: GenOutput::Text("Refund issued.".into()),
+                    usage: Usage::default(),
+                })
+            })
+        }
+    }
+
+    fn draft() -> Node {
+        Node::Generate {
+            id: "draft".into(),
+            task: "Draft a billing reply".into(),
+            reads: vec![],
+            output: OutputSpec::Schema(JsonSchema(json!({
+                "type": "object",
+                "required": ["reply"],
+                "properties": { "reply": { "type": "string" } }
+            }))),
+            max_tokens: 32,
+            gate: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_invalid_records_a_signal_before_the_error() {
+        let machine = Machine::builder().generative(TextGen).build();
+        let node = draft();
+        let mut state = State::new();
+        let decisions = Decisions::new();
+        let mut events = EventLog::default();
+        let mut trace = Trace {
+            events: &[],
+            next: 0,
+        };
+        let err = machine
+            .step(
+                &|_| None,
+                &node,
+                &mut state,
+                &decisions,
+                &mut events,
+                &mut trace,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarnessError::SchemaInvalid(_)));
+        assert!(events.iter().all(|event| event.kind != EventKind::Generate));
+        assert_eq!(events.signals().len(), 1);
+        assert_eq!(events.signals()[0].check, "schema_invalid");
+        assert_eq!(events.signals()[0].node, "draft".into());
+        assert_eq!(events.signals()[0].finding, err.to_string());
+    }
+
+    #[tokio::test]
+    async fn schema_invalid_run_returns_only_the_error() {
+        let machine = Machine::builder().generative(TextGen).build();
+        let workflow = Workflow::new("draft".into(), vec![draft()], |_, _, _| Next::End).unwrap();
+        let err = machine.run(&workflow, State::new()).await.unwrap_err();
+        assert!(matches!(err, HarnessError::SchemaInvalid(_)));
     }
 }
