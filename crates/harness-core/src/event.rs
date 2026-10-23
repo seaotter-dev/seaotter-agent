@@ -118,7 +118,6 @@ impl EventLog {
         self.grants.push(decision);
     }
 
-    #[allow(dead_code)]
     pub(crate) fn push_signal(&mut self, signal: Signal) {
         self.signals.push(signal);
     }

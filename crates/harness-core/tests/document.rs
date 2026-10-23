@@ -517,6 +517,10 @@ async fn low_confidence_takes_the_document_queue_edge() {
     assert_eq!(run.status, RunStatus::Completed);
     assert_eq!(ends_at(&run.path), Some("queue"));
     assert!(!run.path.iter().any(|id| id.0 == "billing"));
+    assert_eq!(run.events.signals().len(), 1);
+    assert_eq!(run.events.signals()[0].check, "confidence_low");
+    assert_eq!(run.events.signals()[0].node, "classify".into());
+    assert_eq!(run.events.signals()[0].finding, "safe_default");
 }
 
 #[tokio::test]
@@ -747,6 +751,10 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .all(|event| event.kind != EventKind::Effect)
     );
     assert_eq!(held.events.grants(), &[skipped_grant()]);
+    assert_eq!(held.events.signals().len(), 1);
+    assert_eq!(held.events.signals()[0].check, "write_skipped");
+    assert_eq!(held.events.signals()[0].node, "read".into());
+    assert_eq!(held.events.signals()[0].finding, "file_read");
     assert_eq!(ends_at(&held.path), Some("held"));
 
     let mut waiting = granted_read(
@@ -788,6 +796,8 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .all(|event| event.kind != EventKind::Effect)
     );
     assert_eq!(denied.events.grants(), &[skipped_grant()]);
+    assert_eq!(denied.events.signals().len(), 1);
+    assert_eq!(denied.events.signals()[0].check, "write_skipped");
     assert_eq!(ends_at(&denied.path), Some("held"));
 
     let (calls, effect) = counting("file_read", Capability::FileRead);
@@ -809,6 +819,7 @@ async fn a_write_effect_waits_for_the_human_gate() {
             .iter()
             .any(|event| event.kind == EventKind::Effect)
     );
+    assert!(allowed.events.signals().is_empty());
     assert_eq!(
         allowed.events.grants(),
         &[GrantDecision {
