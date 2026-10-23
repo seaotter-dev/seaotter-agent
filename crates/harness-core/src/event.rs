@@ -32,6 +32,17 @@ pub struct GrantDecision {
     pub gate: GateOutcome,
 }
 
+/// One check recorded on the run log.
+///
+/// A credential is not a field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Signal {
+    pub check: String,
+    pub node: NodeId,
+    pub finding: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventKind {
@@ -64,13 +75,14 @@ pub struct Event {
 }
 
 /// Append-only log of decide, generate, and effect steps, plus one grant
-/// decision per document effect that was skipped or run.
+/// decision per document effect that was skipped or run, and any signals.
 ///
 /// Events can be read. Nothing in this type updates or removes one.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EventLog {
     events: Vec<Event>,
     grants: Vec<GrantDecision>,
+    signals: Vec<Signal>,
 }
 
 impl EventLog {
@@ -94,6 +106,10 @@ impl EventLog {
         &self.grants
     }
 
+    pub fn signals(&self) -> &[Signal] {
+        &self.signals
+    }
+
     pub(crate) fn push(&mut self, event: Event) {
         self.events.push(event);
     }
@@ -102,16 +118,29 @@ impl EventLog {
         self.grants.push(decision);
     }
 
+    #[allow(dead_code)]
+    pub(crate) fn push_signal(&mut self, signal: Signal) {
+        self.signals.push(signal);
+    }
+
     /// Appends this log to `path`. The header and step lines match
     /// [`append_run`]. Each grant decision is one later line with `run_id`,
-    /// `owner`, `tier`, `tool`, and `gate`.
+    /// `owner`, `tier`, `tool`, and `gate`. Each signal is one later line
+    /// with `run_id`, `check`, `node`, and `finding`.
     pub fn append_to(
         &self,
         path: &Path,
         workflow: &str,
         user_id: &str,
     ) -> Result<String, HarnessError> {
-        write_run(path, workflow, user_id, &self.events, &self.grants)
+        write_run(
+            path,
+            workflow,
+            user_id,
+            &self.events,
+            &self.grants,
+            &self.signals,
+        )
     }
 }
 
@@ -178,6 +207,14 @@ struct GrantLine<'a> {
     gate: GateOutcome,
 }
 
+#[derive(Serialize)]
+struct SignalLine<'a> {
+    run_id: &'a str,
+    check: &'a str,
+    node: &'a NodeId,
+    finding: &'a str,
+}
+
 /// Appends one run to `path` as JSON lines. The first line is the header.
 /// Each later line is one decide, generate, or effect step. The write is a
 /// single append. This function does not read provider keys.
@@ -187,7 +224,7 @@ pub fn append_run(
     user_id: &str,
     events: &[Event],
 ) -> Result<String, HarnessError> {
-    write_run(path, workflow, user_id, events, &[])
+    write_run(path, workflow, user_id, events, &[], &[])
 }
 
 fn write_run(
@@ -196,6 +233,7 @@ fn write_run(
     user_id: &str,
     events: &[Event],
     grants: &[GrantDecision],
+    signals: &[Signal],
 ) -> Result<String, HarnessError> {
     let run_id = new_run_id();
     let mut body = json_line(&RunHeader {
@@ -222,6 +260,14 @@ fn write_run(
             tier: decision.tier,
             tool: &decision.tool,
             gate: decision.gate,
+        })?);
+    }
+    for signal in signals {
+        body.push_str(&json_line(&SignalLine {
+            run_id: &run_id,
+            check: &signal.check,
+            node: &signal.node,
+            finding: &signal.finding,
         })?);
     }
     if let Some(parent) = path.parent()
@@ -283,4 +329,58 @@ fn json_line(value: &impl Serialize) -> Result<String, HarnessError> {
         .map_err(|err| HarnessError::Workflow(format!("run log: {err}")))?;
     line.push('\n');
     Ok(line)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_signal_appends_without_a_credential_and_replay_skips_it() {
+        let mut log = EventLog::default();
+        log.push(Event {
+            node: "classify".into(),
+            name: "classify".into(),
+            kind: EventKind::Decide,
+            input_hash: "abc".into(),
+            output: json!({"route": "billing"}),
+            confidence: Some(0.9),
+            usage: Usage::default(),
+        });
+        log.push_signal(Signal {
+            check: "baseline_missing".into(),
+            node: "classify".into(),
+            finding: "no prior runs".into(),
+        });
+        assert_eq!(log.signals().len(), 1);
+        let path = std::env::temp_dir().join(format!("seaotter-signal-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let id = log.append_to(&path, "document", "user-7").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let signal_line = text
+            .lines()
+            .find(|line| line.contains("\"check\""))
+            .expect("signal line");
+        assert!(
+            signal_line.contains("\"check\":\"baseline_missing\""),
+            "{signal_line}"
+        );
+        assert!(
+            signal_line.contains("\"node\":\"classify\""),
+            "{signal_line}"
+        );
+        assert!(
+            signal_line.contains("\"finding\":\"no prior runs\""),
+            "{signal_line}"
+        );
+        assert!(!signal_line.contains("\"kind\""), "{signal_line}");
+        for key in ["COMPOSIO_API_KEY", "host_permission"] {
+            assert!(!text.contains(key), "{key} in {text}");
+        }
+        let read = read_run(&path, &id).unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].kind, EventKind::Decide);
+        std::fs::remove_file(&path).unwrap();
+    }
 }
