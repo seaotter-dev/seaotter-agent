@@ -43,7 +43,7 @@ pub use decision::{
 };
 pub use diff::{Divergence, diff_runs};
 pub use document::{BranchEdge, BranchWhen, DocumentNode, RiskTier, WorkflowDocument};
-pub use drift::{Baseline, PriorRun, load_baseline};
+pub use drift::{Baseline, DriftThresholds, PriorRun, load_baseline};
 pub use effect::{Capability, Effect};
 pub use error::HarnessError;
 pub use eval::{FixtureError, check_answer_fixture, check_branch_fixture};

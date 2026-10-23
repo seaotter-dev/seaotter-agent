@@ -1,6 +1,7 @@
 //! Prior runs of one workflow, read from the append-only log.
 //!
-//! This module loads history. It does not compare a new run with that history.
+//! [`Baseline::drift`] compares a new run with that history and returns one
+//! signal per finding. It does not change the step list.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -42,6 +43,136 @@ impl Baseline {
             node: node.clone(),
             finding: "no prior runs".into(),
         })
+    }
+
+    /// One signal per branch, confidence, or output finding.
+    ///
+    /// An empty baseline returns nothing. A node with no baseline confidence
+    /// is not a confidence finding.
+    pub fn drift(&self, current: &[Event], thresholds: &DriftThresholds) -> Vec<Signal> {
+        if self.runs.is_empty() {
+            return Vec::new();
+        }
+        let mut signals = Vec::new();
+        let current_nodes: Vec<NodeId> = current.iter().map(|event| event.node.clone()).collect();
+        let matched = self
+            .runs
+            .iter()
+            .filter(|run| node_sequence(&run.events) == current_nodes)
+            .count();
+        let share = matched as f64 / self.runs.len() as f64;
+        if share < thresholds.branch_match
+            && let Some(node) = branch_node(&current_nodes, &majority_sequence(&self.runs))
+        {
+            signals.push(Signal {
+                check: "drift_branch".into(),
+                node,
+                finding: "branch".into(),
+            });
+        }
+        for event in current {
+            let Some(confidence) = event.confidence else {
+                continue;
+            };
+            let mut samples: Vec<f64> = self
+                .runs
+                .iter()
+                .flat_map(|run| run.events.iter())
+                .filter(|prior| prior.node == event.node)
+                .filter_map(|prior| prior.confidence)
+                .collect();
+            if samples.is_empty() {
+                continue;
+            }
+            let median = median(&mut samples);
+            if (confidence - median).abs() > thresholds.confidence_delta {
+                signals.push(Signal {
+                    check: "drift_confidence".into(),
+                    node: event.node.clone(),
+                    finding: "confidence".into(),
+                });
+            }
+        }
+        for (index, event) in current.iter().enumerate() {
+            let mut compared = 0usize;
+            let mut matched = 0usize;
+            for run in &self.runs {
+                let Some(prior) = run.events.get(index) else {
+                    continue;
+                };
+                compared += 1;
+                if prior.output == event.output {
+                    matched += 1;
+                }
+            }
+            if compared > 0 && (matched as f64) / (compared as f64) < thresholds.output_match {
+                signals.push(Signal {
+                    check: "drift_output".into(),
+                    node: event.node.clone(),
+                    finding: "output".into(),
+                });
+            }
+        }
+        signals
+    }
+}
+
+/// Caller-supplied shares and gaps for [`Baseline::drift`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DriftThresholds {
+    /// Minimum share of baseline runs that must use the new node sequence.
+    pub branch_match: f64,
+    /// Maximum absolute gap from the median baseline confidence for a node.
+    pub confidence_delta: f64,
+    /// Minimum share of baseline events at an index that must share the new output.
+    pub output_match: f64,
+}
+
+fn node_sequence(events: &[Event]) -> Vec<NodeId> {
+    events.iter().map(|event| event.node.clone()).collect()
+}
+
+fn majority_sequence(runs: &[PriorRun]) -> Vec<NodeId> {
+    let mut counts: Vec<(Vec<NodeId>, usize)> = Vec::new();
+    for run in runs {
+        let sequence = node_sequence(&run.events);
+        if let Some((_, count)) = counts.iter_mut().find(|(seen, _)| seen == &sequence) {
+            *count += 1;
+        } else {
+            counts.push((sequence, 1));
+        }
+    }
+    let mut best: Option<(Vec<NodeId>, usize)> = None;
+    for (sequence, count) in counts {
+        if best
+            .as_ref()
+            .is_none_or(|(_, best_count)| count > *best_count)
+        {
+            best = Some((sequence, count));
+        }
+    }
+    best.map(|(sequence, _)| sequence).unwrap_or_default()
+}
+
+fn branch_node(current: &[NodeId], reference: &[NodeId]) -> Option<NodeId> {
+    for (index, node) in current.iter().enumerate() {
+        if reference.get(index) != Some(node) {
+            return Some(node.clone());
+        }
+    }
+    current
+        .last()
+        .cloned()
+        .or_else(|| reference.first().cloned())
+}
+
+fn median(values: &mut [f64]) -> f64 {
+    values.sort_by(|left, right| left.total_cmp(right));
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
     }
 }
 
@@ -138,8 +269,8 @@ struct StoredStep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{EventKind, append_run};
-    use serde_json::json;
+    use crate::event::{EventKind, EventLog, append_run, read_run};
+    use serde_json::{Value, json};
 
     fn step(node: &str, confidence: f64) -> Event {
         Event {
@@ -213,5 +344,136 @@ mod tests {
             "baseline_missing"
         );
         std::fs::remove_file(&path).unwrap();
+    }
+
+    fn event(node: &str, confidence: f64, output: Value) -> Event {
+        Event {
+            node: node.into(),
+            name: node.into(),
+            kind: EventKind::Decide,
+            input_hash: "abc".into(),
+            output,
+            confidence: Some(confidence),
+            usage: Usage::default(),
+        }
+    }
+
+    fn strict() -> DriftThresholds {
+        DriftThresholds {
+            branch_match: 1.0,
+            confidence_delta: 0.1,
+            output_match: 1.0,
+        }
+    }
+
+    fn prior_runs(name: &str, runs: &[Vec<Event>]) -> (Baseline, std::path::PathBuf) {
+        let path = log_path(name);
+        for run in runs {
+            append_run(&path, "ticket", "user-7", run).unwrap();
+        }
+        let baseline = load_baseline(&path, "ticket", "current-run").unwrap();
+        (baseline, path)
+    }
+
+    #[test]
+    fn a_run_inside_the_thresholds_has_no_drift() {
+        let prior = vec![event("classify", 0.9, json!({"route": "billing"}))];
+        let (baseline, path) = prior_runs("inside", &[prior]);
+        let signals = baseline.drift(
+            &[event("classify", 0.85, json!({"route": "billing"}))],
+            &strict(),
+        );
+        assert!(signals.is_empty());
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn branch_confidence_and_output_each_append_one_signal() {
+        let prior = vec![
+            event("classify", 0.9, json!({"route": "billing"})),
+            event("billing", 0.8, json!({"done": true})),
+        ];
+        let (baseline, path) = prior_runs("drifted", &[prior.clone(), prior]);
+        let current = vec![
+            event("classify", 0.4, json!({"route": "technical"})),
+            event("queue", 0.8, json!({"done": true})),
+        ];
+        let signals = baseline.drift(&current, &strict());
+        assert_eq!(
+            signals
+                .iter()
+                .map(|signal| (
+                    signal.check.as_str(),
+                    signal.node.0.as_str(),
+                    signal.finding.as_str()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("drift_branch", "queue", "branch"),
+                ("drift_confidence", "classify", "confidence"),
+                ("drift_output", "classify", "output"),
+            ]
+        );
+
+        let mut log = EventLog::default();
+        for step in &current {
+            log.push(step.clone());
+        }
+        for signal in signals {
+            log.push_signal(signal);
+        }
+        assert_eq!(log.len(), current.len());
+        let recorded = log_path("drifted-log");
+        let run_id = log.append_to(&recorded, "ticket", "user-7").unwrap();
+        assert_eq!(read_run(&recorded, &run_id).unwrap(), current);
+        let text = std::fs::read_to_string(&recorded).unwrap();
+        let lines: Vec<Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .filter(|value: &Value| value.get("check").is_some())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| line.get("kind").is_none()));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&recorded).unwrap();
+    }
+
+    #[test]
+    fn a_recorded_minority_branch_is_still_drift() {
+        let (baseline, path) = prior_runs(
+            "minority",
+            &[
+                vec![event("billing", 0.9, json!({"route": "billing"}))],
+                vec![event("technical", 0.9, json!({"route": "billing"}))],
+            ],
+        );
+        let signals = baseline.drift(
+            &[event("technical", 0.9, json!({"route": "billing"}))],
+            &DriftThresholds {
+                branch_match: 1.0,
+                confidence_delta: 0.0,
+                output_match: 0.5,
+            },
+        );
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].check, "drift_branch");
+        assert_eq!(signals[0].node, "technical".into());
+        assert_eq!(signals[0].finding, "branch");
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_empty_baseline_has_no_drift_findings() {
+        let missing = log_path("missing-drift");
+        let baseline = load_baseline(&missing, "ticket", "absent").unwrap();
+        assert!(
+            baseline
+                .drift(&[step("classify", 0.9)], &strict())
+                .is_empty()
+        );
+        assert_eq!(
+            baseline.missing_signal(&"classify".into()).unwrap().check,
+            "baseline_missing"
+        );
     }
 }
