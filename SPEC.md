@@ -199,3 +199,48 @@ Tracked in Linear under the [Consultant MCP](https://linear.app/seaotter-dev/pro
 6. Composio
    * SEA-411 Run a granted Composio action
    * SEA-413 Check the gates before the credential backend
+
+## Goal (production run checks)
+
+A signal is one JSON line on the run log. It names the check, the node, and the finding. It carries no credential. Replay does not treat it as a step.
+
+A baseline is the prior runs of the same workflow in the append-only log, excluding the current run. Drift compares the new run's branch, confidence, and output with that baseline using caller-supplied thresholds. An anomaly is one run that takes a branch the baseline never recorded, whose confidence is below every baseline confidence for that node, or that records an effect error. Each finding appends one signal. The document path does not change. A valid rare branch is a signal and not a halt.
+
+A missing baseline appends `baseline_missing` and does not invent a baseline or a drift result. `diff_runs` stays a comparison of two runs.
+
+The issues listed under [production run checks slices](#production-run-checks-slices) are this phase's work breakdown. Stay inside the non-goals.
+
+## Non-goals (production run checks)
+
+* An external metrics or paging service
+* A hosted API
+* A dashboard
+* A change to the human gate
+* A model that chooses the next step
+
+## Production run checks acceptance
+
+* A signal is one JSON line on the run log. It names the check, the node, and the finding, and it carries no credential.
+* Replay does not treat a signal line as a step.
+* A baseline is the prior runs of the same workflow, excluding the current run.
+* Drift compares branch, confidence, and output with the baseline using caller-supplied thresholds. Each finding appends one signal.
+* An anomaly is a branch the baseline never recorded, a confidence below every baseline confidence for that node, or an effect error. Each finding appends one signal.
+* A valid rare branch is a signal and not a halt. The document path does not change.
+* A missing baseline appends `baseline_missing` and does not invent a baseline or a drift result.
+* `diff_runs` stays a comparison of two runs.
+
+## Production run checks slices
+
+Tracked in Linear under the [Production run checks](https://linear.app/seaotter-dev/project/production-run-checks-ea1332654148) project.
+
+1. Spec
+   * SEA-415 Land the production-check spec
+2. Signals
+   * SEA-416 Add a signal line to the run log
+   * SEA-417 Emit a signal for a low-confidence decision, a skipped write, and a schema failure
+3. Drift
+   * SEA-418 Build a baseline from prior runs of one workflow
+   * SEA-419 Report drift and append it as a signal
+4. Anomaly
+   * SEA-420 Report an anomaly and append it as a signal
+   * SEA-421 Check drift and anomaly at the end of a document run
