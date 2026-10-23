@@ -46,7 +46,8 @@ pub use effect::{Capability, Effect};
 pub use error::HarnessError;
 pub use eval::{FixtureError, check_answer_fixture, check_branch_fixture};
 pub use event::{
-    Event, EventKind, EventLog, GateOutcome, GrantDecision, Usage, append_run, input_hash, read_run,
+    Event, EventKind, EventLog, GateOutcome, GrantDecision, Signal, Usage, append_run, input_hash,
+    read_run,
 };
 pub use future::BoxFuture;
 pub use generate::{GenOutput, GenRequest, GenResponse, GenerativeModel, JsonSchema, OutputSpec};
