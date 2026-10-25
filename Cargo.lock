@@ -1437,6 +1437,8 @@ version = "0.1.0"
 dependencies = [
  "harness-core",
  "seaotter-mcp",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
