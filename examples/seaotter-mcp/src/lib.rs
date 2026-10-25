@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use harness_core::{
-    BranchWhen, ConfidenceAction, DecisionModel, DocumentNode, HarnessError, Machine, RiskTier,
-    Run, State, WorkflowDocument, apply_reply,
+    BranchWhen, ConfidenceAction, DecisionModel, DocumentNode, EventKind, HarnessError, Machine,
+    RiskTier, Run, State, WorkflowDocument, append_run, apply_reply,
 };
 use serde_json::{Map, Value, json};
 
@@ -84,24 +84,26 @@ impl Server {
         })
     }
 
-    pub async fn run(&self) -> Result<Run, HarnessError> {
+    pub async fn run(&self) -> Result<String, HarnessError> {
         let doc = self.load_workflow()?;
-        Machine::builder()
+        let run = Machine::builder()
             .build()
             .run_document(&doc, State::new(), None)
-            .await
+            .await?;
+        self.record(&run)
     }
 
     pub async fn run_with(
         &self,
         decision: impl DecisionModel + 'static,
-    ) -> Result<Run, HarnessError> {
+    ) -> Result<String, HarnessError> {
         let doc = self.load_workflow()?;
-        Machine::builder()
+        let run = Machine::builder()
             .decision(decision)
             .build()
             .run_document(&doc, State::new(), None)
-            .await
+            .await?;
+        self.record(&run)
     }
 
     /// One JSON-RPC message. A notification returns `None`.
@@ -151,10 +153,7 @@ impl Server {
                 .map(|doc| wireframe(&doc)),
             "workflow_show" => self.load_workflow().map(|doc| wireframe(&doc)),
             "workflow_save" => self.save().map(|()| "saved".to_owned()),
-            "workflow_run" => self.run().await.map(|run| {
-                let path: Vec<_> = run.path.iter().map(|id| id.0.as_str()).collect();
-                serde_json::to_string(&path).unwrap_or_default()
-            }),
+            "workflow_run" => self.run().await,
             "grant_list" => self.grant_list().and_then(|names| {
                 serde_json::to_string(&names)
                     .map_err(|err| HarnessError::Workflow(format!("grant list: {err}")))
@@ -186,6 +185,28 @@ impl Server {
         let path = self.grants_path();
         std::fs::write(&path, format!("{text}\n"))
             .map_err(|err| HarnessError::Workflow(format!("writing {}: {err}", path.display())))
+    }
+
+    fn record(&self, run: &Run) -> Result<String, HarnessError> {
+        let id = append_run(&self.dir.join("log"), "workflow", "", run.events.as_slice())?;
+        let destination = run
+            .path
+            .last()
+            .map(|node| node.0.as_str())
+            .unwrap_or("unknown");
+        let confidence = run
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::Decide)
+            .and_then(|event| event.confidence)
+            .unwrap_or(0.0);
+        let generate = run
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::Generate);
+        Ok(format!(
+            "destination: {destination}\nconfidence: {confidence}\ngenerate: {generate}\nrun_id: {id}"
+        ))
     }
 
     fn load_workflow(&self) -> Result<WorkflowDocument, HarnessError> {
