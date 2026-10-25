@@ -268,3 +268,31 @@ async fn a_scripted_run_reaches_billing() {
         .unwrap();
     assert_eq!(run.path.last().map(|id| id.0.as_str()), Some("billing"));
 }
+
+#[tokio::test]
+async fn a_new_server_on_the_same_directory_reads_the_workflow() {
+    let directory = dir("mount");
+    {
+        let mut server = Server::open(&directory);
+        server.propose("fixture", "read", REPLY).unwrap();
+        server.save().unwrap();
+    }
+    let mut server = Server::open(&directory);
+    let response = server
+        .handle(&json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": { "name": "workflow_show", "arguments": {} }
+        }))
+        .await
+        .unwrap();
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(response["result"]["isError"], false);
+    assert!(text.contains("classify"), "{text}");
+
+    let saved = std::fs::read_to_string(workflow_file(&directory)).unwrap();
+    for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY", "TYPESAFE_API_KEY"] {
+        assert!(!saved.contains(key), "{key} in {saved}");
+    }
+}
