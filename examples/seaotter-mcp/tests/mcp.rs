@@ -131,7 +131,7 @@ async fn propose_ignores_a_host_permission_and_the_file_stores_no_key() {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(response["result"]["isError"], false);
     assert!(text.contains("Display this flowchart."), "{text}");
-    assert!(text.contains("classify decide"), "{text}");
+    assert!(text.contains("classify decide route"), "{text}");
     assert!(text.contains("route equals billing"), "{text}");
     assert!(text.contains("safe_default"), "{text}");
     assert!(!text.contains("host_permission"), "{text}");
@@ -179,7 +179,47 @@ async fn show_returns_the_allow_condition() {
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(response["result"]["isError"], false);
     assert!(text.contains("Display this flowchart."), "{text}");
-    assert!(text.contains("draft generate allow true"), "{text}");
+    assert!(
+        text.contains("draft generate Draft a short reply to this support request."),
+        "{text}"
+    );
+    assert!(text.contains("allow true"), "{text}");
+}
+
+#[tokio::test]
+async fn show_returns_the_effect_name() {
+    let directory = dir("effect");
+    std::fs::write(
+        workflow_file(&directory),
+        r#"{
+  "owner": "fixture",
+  "tier": "read",
+  "grants": ["file_read"],
+  "start": "read",
+  "nodes": [{
+    "kind": "effect",
+    "id": "read",
+    "name": "file_read",
+    "reads": ["path"]
+  }],
+  "edges": []
+}
+"#,
+    )
+    .unwrap();
+    let mut server = Server::open(&directory);
+    let response = server
+        .handle(&json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": { "name": "workflow_show", "arguments": {} }
+        }))
+        .await
+        .unwrap();
+    let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(response["result"]["isError"], false);
+    assert!(text.contains("read effect file_read"), "{text}");
 }
 
 #[tokio::test]
