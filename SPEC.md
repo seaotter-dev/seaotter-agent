@@ -244,3 +244,21 @@ Tracked in Linear under the [Production run checks](https://linear.app/seaotter-
 4. Anomaly
    * SEA-420 Report an anomaly and append it as a signal
    * SEA-421 Check drift and anomaly at the end of a document run
+
+## Local workflow app
+
+The container serves one local page. The page has a chat column and the workflow graph beside it.
+
+Chat may call only the catalog. The catalog operations are add decide, add generate, add effect, connect, set gate, and set the low-confidence edge. Those calls become the saved workflow document: decide, generate, and effect nodes, branch edges, and gates. The document contains no function pointers. An unknown operation is rejected and the document is unchanged.
+
+The effect names are `file_read`, `http_get`, and `composio`. `shell` is rejected. `composio` stores a connection id and one action name, and stores no token. An action outside the grant is rejected.
+
+The canvas shows that graph, including every node, edge, and gate. Edit, run, and save use that document. At run time the document's edges are the transition. The run does not call the builder, the model does not choose the next node, and the request carries no tool list.
+
+Out of this project:
+
+* a personal agent that does the task
+* an app catalog
+* a visual module store
+* a control plane
+* a native Mac app
