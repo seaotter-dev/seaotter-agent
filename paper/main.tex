@@ -175,41 +175,50 @@ Figure~\ref{fig:automata} is the state machine for each example.
 
 \begin{figure}[t]
 \centering
-\begin{tikzpicture}[
-  >=Stealth,
-  shorten >=1pt,
-  node distance=7mm and 14mm,
-  every state/.style={font=\footnotesize, inner sep=1.5pt, minimum size=0pt},
-  every edge/.style={font=\scriptsize},
-  initial text={}
-]
-  \node[state, initial] (n) {normalize};
-  \node[state, right=of n] (c) {classify};
-  \node[state, above right=1mm and 16mm of c] (b) {billing};
-  \node[state, right=18mm of c] (t) {technical};
-  \node[state, below right=1mm and 16mm of c] (a) {account};
-  \node[state, below=of a] (q) {queue};
+\tikzset{
+  workflow/.style={
+    >=Stealth,
+    shorten >=2pt,
+    shorten <=2pt,
+    every state/.style={font=\footnotesize, inner sep=2.5pt, minimum size=9mm},
+    lbl/.style={font=\scriptsize, fill=white, inner sep=1.5pt},
+    initial text={},
+    initial distance=7mm
+  }
+}
+{\footnotesize (a) Ticket router}\\[0.35em]
+\begin{tikzpicture}[workflow]
+  \node[state, initial] (n) at (0,2.7) {normalize};
+  \node[state] (c) at (3.7,2.7) {classify};
+  \node[state, accepting] (b) at (1.15,0) {billing};
+  \node[state, accepting] (t) at (3.7,0) {technical};
+  \node[state, accepting] (a) at (6.25,0) {account};
+  \node[state, accepting] (q) at (8.8,0) {queue};
   \path[->] (n) edge (c)
-            (c) edge node[above] {billing} (b)
-            (c) edge node[above] {technical} (t)
-            (c) edge node[below] {account} (a)
-            (c) edge node[right] {queue} (q);
-  \begin{scope}[yshift=-32mm]
-    \node[state, initial] (gn) {normalize};
-    \node[state, right=of gn] (gg) {gate};
-    \node[state, above right=1mm and 14mm of gg] (gd) {draft};
-    \node[state, right=of gd] (gdd) {drafted};
-    \node[state, below right=1mm and 14mm of gg] (gs) {safe};
-    \path[->] (gn) edge (gg)
-              (gg) edge node[above] {true} (gd)
-              (gd) edge (gdd)
-              (gg) edge node[below] {false} (gs)
-              (gg) edge[bend right=15] node[below] {low} (gs);
-  \end{scope}
+    (c) edge node[lbl, pos=0.62, left] {billing} (b)
+    (c) edge node[lbl, pos=0.45, left] {technical} (t)
+    (c) edge node[lbl, pos=0.45, right] {account} (a)
+    (c) edge node[lbl, pos=0.62, right] {queue} (q);
 \end{tikzpicture}
-\caption{Measured automata. Low confidence in the ticket router takes
-\texttt{queue}. A false or low-confidence gate takes \texttt{safe} and does
-not call the generative model.}
+
+\vspace{0.9em}
+{\footnotesize (b) Gated generation}\\[0.35em]
+\begin{tikzpicture}[workflow]
+  \node[state, initial] (n) at (0,0) {normalize};
+  \node[state] (g) at (3.6,0) {gate};
+  \node[state] (d) at (6.7,1.2) {draft};
+  \node[state, accepting] (dd) at (9.6,1.2) {drafted};
+  \node[state, accepting] (s) at (6.7,-1.35) {safe};
+  \path[->] (n) edge (g)
+    (g) edge node[lbl, pos=0.55, above] {true} (d)
+    (d) edge (dd)
+    (g) edge[out=-30, in=170] node[lbl, pos=0.42, above] {false} (s)
+    (g) edge[out=-80, in=215] node[lbl, pos=0.55, below] {low} (s);
+\end{tikzpicture}
+\caption{Workflow automata.
+(a)~Low confidence in the ticket router takes \texttt{queue}.
+(b)~A false or low-confidence gate takes \texttt{safe} and does not call
+the generative model.}
 \label{fig:automata}
 \end{figure}
 
