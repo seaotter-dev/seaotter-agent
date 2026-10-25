@@ -66,6 +66,82 @@ fn decide(id: &str) -> DocumentNode {
 }
 
 #[test]
+fn edits_update_the_document_without_a_model() {
+    let mut doc = WorkflowDocument::new(
+        "fixture",
+        RiskTier::Read,
+        BTreeSet::<String>::new(),
+        "classify".into(),
+        vec![
+            decide("classify"),
+            DocumentNode::Generate {
+                id: "draft".into(),
+                task: "Draft a reply.".into(),
+                reads: vec!["ticket".into()],
+                output: OutputSpec::FreeText,
+                max_tokens: 32,
+                gate: Some(Gate {
+                    decide: "classify".into(),
+                    question: "route".into(),
+                    allow: "billing".into(),
+                }),
+            },
+        ],
+        vec![
+            BranchEdge {
+                from: "classify".into(),
+                when: BranchWhen::Always,
+                to: "draft".into(),
+            },
+            BranchEdge {
+                from: "classify".into(),
+                when: BranchWhen::Label {
+                    question: "route".into(),
+                    equals: "billing".into(),
+                },
+                to: "billing".into(),
+            },
+        ],
+        BTreeMap::new(),
+    )
+    .unwrap();
+
+    doc.set_question(
+        "classify",
+        "route",
+        Question::choice("Which queue?", [("billing", "Payments")]).unwrap(),
+    )
+    .unwrap();
+    doc.delete_node("draft").unwrap();
+    doc.reconnect(
+        "classify",
+        &BranchWhen::Label {
+            question: "route".into(),
+            equals: "billing".into(),
+        },
+        "queue",
+    )
+    .unwrap();
+
+    let saved = serde_json::to_string(&doc).unwrap();
+    assert!(saved.contains("Which queue?"), "{saved}");
+    assert!(!saved.contains("draft"), "{saved}");
+    assert_eq!(doc.edges.len(), 1);
+    assert_eq!(doc.edges[0].to, NodeId::from("queue"));
+    assert_eq!(doc.start, NodeId::from("classify"));
+
+    let prior = doc.clone();
+    let err = doc
+        .set_question("classify", "missing", Question::noul("unused"))
+        .unwrap_err();
+    assert_eq!(
+        err,
+        HarnessError::Workflow("question `missing` is not on `classify`".into())
+    );
+    assert_eq!(doc, prior);
+}
+
+#[test]
 fn ticket_router_fixture_round_trips() {
     assert!(!TICKET_ROUTER.contains("normalize"));
     assert!(!TICKET_ROUTER.contains("step"));
