@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use harness_core::{
-    BranchWhen, ConfidenceAction, DecisionModel, DocumentNode, EventKind, HarnessError, Machine,
-    RiskTier, Run, State, WorkflowDocument, append_run, apply_reply,
+    BranchWhen, ConfidenceAction, DecisionModel, DocumentNode, HarnessError, Machine, RiskTier,
+    Run, State, WorkflowDocument, apply_reply,
 };
 use serde_json::{Map, Value, json};
 
@@ -84,26 +84,24 @@ impl Server {
         })
     }
 
-    pub async fn run(&self) -> Result<String, HarnessError> {
+    pub async fn run(&self) -> Result<Run, HarnessError> {
         let doc = self.load_workflow()?;
-        let run = Machine::builder()
+        Machine::builder()
             .build()
             .run_document(&doc, State::new(), None)
-            .await?;
-        self.record(&run)
+            .await
     }
 
     pub async fn run_with(
         &self,
         decision: impl DecisionModel + 'static,
-    ) -> Result<String, HarnessError> {
+    ) -> Result<Run, HarnessError> {
         let doc = self.load_workflow()?;
-        let run = Machine::builder()
+        Machine::builder()
             .decision(decision)
             .build()
             .run_document(&doc, State::new(), None)
-            .await?;
-        self.record(&run)
+            .await
     }
 
     /// One JSON-RPC message. A notification returns `None`.
@@ -153,7 +151,10 @@ impl Server {
                 .map(|doc| wireframe(&doc)),
             "workflow_show" => self.load_workflow().map(|doc| wireframe(&doc)),
             "workflow_save" => self.save().map(|()| "saved".to_owned()),
-            "workflow_run" => self.run().await,
+            "workflow_run" => self.run().await.map(|run| {
+                let path: Vec<_> = run.path.iter().map(|id| id.0.as_str()).collect();
+                serde_json::to_string(&path).unwrap_or_default()
+            }),
             "grant_list" => self.grant_list().and_then(|names| {
                 serde_json::to_string(&names)
                     .map_err(|err| HarnessError::Workflow(format!("grant list: {err}")))
@@ -185,28 +186,6 @@ impl Server {
         let path = self.grants_path();
         std::fs::write(&path, format!("{text}\n"))
             .map_err(|err| HarnessError::Workflow(format!("writing {}: {err}", path.display())))
-    }
-
-    fn record(&self, run: &Run) -> Result<String, HarnessError> {
-        let id = append_run(&self.dir.join("log"), "workflow", "", run.events.as_slice())?;
-        let destination = run
-            .path
-            .last()
-            .map(|node| node.0.as_str())
-            .unwrap_or("unknown");
-        let confidence = run
-            .events
-            .iter()
-            .find(|event| event.kind == EventKind::Decide)
-            .and_then(|event| event.confidence)
-            .unwrap_or(0.0);
-        let generate = run
-            .events
-            .iter()
-            .any(|event| event.kind == EventKind::Generate);
-        Ok(format!(
-            "destination: {destination}\nconfidence: {confidence}\ngenerate: {generate}\nrun_id: {id}"
-        ))
     }
 
     fn load_workflow(&self) -> Result<WorkflowDocument, HarnessError> {
@@ -276,28 +255,22 @@ fn tool_definitions() -> Vec<Value> {
         .collect()
 }
 
-pub fn wireframe(doc: &WorkflowDocument) -> String {
+fn wireframe(doc: &WorkflowDocument) -> String {
     let mut lines = vec!["flowchart TD".to_owned()];
     for node in &doc.nodes {
         let id = node.id();
-        let label = match node {
-            DocumentNode::Decide { questions, .. } => {
-                let questions = questions
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{id} decide {questions}")
-            }
-            DocumentNode::Generate { task, gate, .. } => {
-                let mut label = format!("{id} generate {task}");
-                if let Some(gate) = gate {
-                    label.push_str(&format!(" allow {}", gate.allow));
-                }
-                label
-            }
-            DocumentNode::Effect { name, .. } => format!("{id} effect {name}"),
+        let kind = match node {
+            DocumentNode::Decide { .. } => "decide",
+            DocumentNode::Generate { .. } => "generate",
+            DocumentNode::Effect { .. } => "effect",
         };
+        let mut label = format!("{id} {kind}");
+        if let DocumentNode::Generate {
+            gate: Some(gate), ..
+        } = node
+        {
+            label.push_str(&format!(" allow {}", gate.allow));
+        }
         lines.push(format!("  {id}[\"{}\"]", escape_label(&label)));
     }
     for edge in &doc.edges {
