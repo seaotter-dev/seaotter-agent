@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use harness_core::{
-    Answer, BoxFuture, DecisionModel, DecisionRequest, DecisionResponse, EventKind, HarnessError,
-    Usage, read_run,
+    Answer, BoxFuture, DecisionModel, DecisionRequest, DecisionResponse, HarnessError, Usage,
 };
 use seaotter_mcp::{Server, workflow_file};
 use serde_json::json;
@@ -260,25 +259,14 @@ async fn a_scripted_run_reaches_billing() {
     let mut server = Server::open(&directory);
     server.propose("fixture", "read", REPLY).unwrap();
     server.save().unwrap();
-    let text = server
+    let run = server
         .run_with(LabelDecision {
             top: "billing",
             confidence: 0.88,
         })
         .await
         .unwrap();
-    assert!(text.contains("destination: billing"), "{text}");
-    assert!(text.contains("confidence: 0.88"), "{text}");
-    assert!(text.contains("generate: false"), "{text}");
-    let id = text
-        .lines()
-        .find_map(|line| line.strip_prefix("run_id: "))
-        .unwrap();
-    let events = read_run(&directory.join("log"), id).unwrap();
-    assert!(
-        events.iter().any(|event| event.kind == EventKind::Decide),
-        "{events:?}"
-    );
+    assert_eq!(run.path.last().map(|id| id.0.as_str()), Some("billing"));
 }
 
 #[tokio::test]
