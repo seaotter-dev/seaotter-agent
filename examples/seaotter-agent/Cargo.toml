@@ -10,5 +10,3 @@ repository.workspace = true
 [dependencies]
 harness-core.workspace = true
 seaotter-mcp = { path = "../seaotter-mcp" }
-serde_json.workspace = true
-tokio.workspace = true

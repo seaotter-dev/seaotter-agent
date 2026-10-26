@@ -3,10 +3,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
-use harness_core::{
-    Answer, BoxFuture, DecisionModel, DecisionRequest, DecisionResponse, HarnessError, Usage,
-};
-use seaotter_mcp::Server;
+use harness_core::{RiskTier, WorkflowDocument, apply_reply};
 
 const PUBLISH: &str = "127.0.0.1:8080:8080";
 
@@ -60,63 +57,11 @@ fn listen_addr() -> SocketAddr {
 }
 
 struct App {
-    server: Server,
-    document: Option<harness_core::WorkflowDocument>,
-    report: String,
-}
-
-struct BillingDecision {
-    top: &'static str,
-    confidence: f64,
-}
-
-impl DecisionModel for BillingDecision {
-    fn evaluate(
-        &self,
-        req: DecisionRequest,
-    ) -> BoxFuture<'_, Result<DecisionResponse, HarnessError>> {
-        let top = self.top.to_owned();
-        let confidence = self.confidence;
-        Box::pin(async move {
-            let answers = req
-                .questions
-                .into_keys()
-                .map(|key| {
-                    (
-                        key,
-                        Answer {
-                            probabilities: std::collections::BTreeMap::from([(
-                                top.clone(),
-                                confidence,
-                            )]),
-                            confidence,
-                        },
-                    )
-                })
-                .collect();
-            Ok(DecisionResponse {
-                answers,
-                usage: Usage::default(),
-            })
-        })
-    }
-}
-
-fn open(dir: &Path) -> App {
-    let server = Server::open(dir);
-    let document = server
-        .show()
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok());
-    App {
-        server,
-        document,
-        report: String::new(),
-    }
+    document: Option<WorkflowDocument>,
 }
 
 fn page() -> String {
-    render(&open(Path::new("/no-such-seaotter-page")), None)
+    render(&App { document: None }, None)
 }
 
 fn render(app: &App, rejection: Option<&str>) -> String {
@@ -132,16 +77,20 @@ fn render(app: &App, rejection: Option<&str>) -> String {
 <body>
 <section id=\"chat\">{rejection}</section>
 <section id=\"graph\">{graph}</section>
-<section id=\"run\">{}</section>
+<section id=\"run\"></section>
 </body>
 </html>
-",
-        app.report
+"
     )
 }
 
 fn submit(app: &mut App, message: &str) -> String {
-    let rejection = match app.server.propose("fixture", "read", message) {
+    let rejection = match apply_reply(
+        "fixture",
+        RiskTier::Read,
+        std::iter::empty::<String>(),
+        message,
+    ) {
         Ok(doc) => {
             app.document = Some(doc);
             None
@@ -149,34 +98,6 @@ fn submit(app: &mut App, message: &str) -> String {
         Err(err) => Some(err.to_string()),
     };
     render(app, rejection.as_deref())
-}
-
-fn save(app: &mut App) -> String {
-    let rejection = match app.server.save() {
-        Ok(()) => None,
-        Err(err) => Some(err.to_string()),
-    };
-    render(app, rejection.as_deref())
-}
-
-fn run_saved(app: &mut App) -> String {
-    let result = tokio::runtime::Runtime::new()
-        .map_err(|err| err.to_string())
-        .and_then(|runtime| {
-            runtime
-                .block_on(app.server.run_with(BillingDecision {
-                    top: "billing",
-                    confidence: 0.88,
-                }))
-                .map_err(|err| err.to_string())
-        });
-    match result {
-        Ok(report) => {
-            app.report = report;
-            render(app, None)
-        }
-        Err(err) => render(app, Some(&err)),
-    }
 }
 
 fn serve_page() -> ExitCode {
@@ -201,7 +122,7 @@ fn serve_page() -> ExitCode {
 }
 
 fn serve(listener: TcpListener) -> Result<(), String> {
-    let mut app = open(Path::new("/data"));
+    let mut app = App { document: None };
     for stream in listener.incoming() {
         let mut stream = stream.map_err(|err| format!("accepting a connection: {err}"))?;
         respond(&mut app, &mut stream)?;
@@ -215,7 +136,10 @@ fn respond(app: &mut App, stream: &mut TcpStream) -> Result<(), String> {
         .read(&mut buf)
         .map_err(|err| format!("reading a request: {err}"))?;
     let request = String::from_utf8_lossy(&buf[..n]).into_owned();
-    let body = handle(app, &request);
+    let body = match posted_message(&request) {
+        Some(message) => submit(app, message),
+        None => render(app, None),
+    };
     let response = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
@@ -225,21 +149,10 @@ fn respond(app: &mut App, stream: &mut TcpStream) -> Result<(), String> {
         .map_err(|err| format!("writing the page: {err}"))
 }
 
-fn handle(app: &mut App, request: &str) -> String {
-    let Some(body) = request.split_once("\r\n\r\n").map(|(_, body)| body.trim()) else {
-        return render(app, None);
-    };
-    if body.is_empty() {
-        return render(app, None);
-    }
-    if body == "save" {
-        return save(app);
-    }
-    if body == "run" {
-        return run_saved(app);
-    }
-    let message = body.strip_prefix("message=").unwrap_or(body);
-    submit(app, message)
+fn posted_message(request: &str) -> Option<&str> {
+    let body = request.split_once("\r\n\r\n")?.1;
+    let body = body.strip_prefix("message=").unwrap_or(body).trim();
+    if body.is_empty() { None } else { Some(body) }
 }
 
 fn ensure_workspace(root: &Path) -> Result<(), String> {
@@ -266,9 +179,8 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::path::PathBuf;
 
-    use super::{App, PUBLISH, Request, ensure_workspace, open, page, parse, respond};
+    use super::{App, PUBLISH, Request, ensure_workspace, page, parse, respond};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(str::to_string).collect()
@@ -322,7 +234,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut app = open(&temp_dir("get"));
+            let mut app = App { document: None };
             respond(&mut app, &mut stream).unwrap();
         });
         let mut stream = std::net::TcpStream::connect(addr).unwrap();
@@ -338,7 +250,7 @@ mod tests {
 
     #[test]
     fn a_message_builds_the_graph_and_a_rejected_call_keeps_it() {
-        let mut app = open(&temp_dir("message"));
+        let mut app = App { document: None };
         let reply = include_str!("../../../crates/harness-core/fixtures/consultant-reply.json");
         let built = post(&mut app, reply);
         let graph = section(&built, "graph");
@@ -373,62 +285,16 @@ mod tests {
         assert!(section(&kept, "run").is_empty(), "{kept}");
     }
 
-    #[test]
-    fn a_saved_run_shows_on_the_page_and_a_second_page() {
-        let directory = temp_dir("saved");
-        let mut app = open(&directory);
-        let reply = include_str!("../../../crates/harness-core/fixtures/consultant-reply.json");
-        post(&mut app, reply);
-        action(&mut app, "save");
-        let saved = std::fs::read_to_string(directory.join("workflow.json")).unwrap();
-        assert!(saved.contains("classify"), "{saved}");
-
-        let ran = action(&mut app, "run");
-        let report = section(&ran, "run");
-        assert!(report.contains("destination: billing"), "{ran}");
-        assert!(report.contains("confidence: 0.88"), "{ran}");
-        assert!(report.contains("generate: false"), "{ran}");
-
-        let mut second = open(&directory);
-        let again = get(&mut second);
-        assert!(section(&again, "graph").contains("classify"), "{again}");
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    fn temp_dir(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("seaotter-agent-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        path
-    }
-
-    fn action(app: &mut App, name: &str) -> String {
-        exchange(app, name)
-    }
-
-    fn get(app: &mut App) -> String {
-        exchange(app, "")
-    }
-
     fn post(app: &mut App, message: &str) -> String {
-        exchange(app, &format!("message={message}"))
-    }
-
-    fn exchange(app: &mut App, payload: &str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let mut client = std::net::TcpStream::connect(addr).unwrap();
         let (mut server, _) = listener.accept().unwrap();
-        let payload_owned = payload.to_owned();
-        let request = if payload_owned.is_empty() {
-            "GET / HTTP/1.1\r\nconnection: close\r\n\r\n".to_owned()
-        } else {
-            format!(
-                "POST / HTTP/1.1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload_owned}",
-                payload_owned.len()
-            )
-        };
+        let payload = format!("message={message}");
+        let request = format!(
+            "POST / HTTP/1.1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
         client.write_all(request.as_bytes()).unwrap();
         respond(app, &mut server).unwrap();
         drop(server);
