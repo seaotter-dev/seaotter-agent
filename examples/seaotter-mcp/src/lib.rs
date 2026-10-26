@@ -276,7 +276,7 @@ fn tool_definitions() -> Vec<Value> {
         .collect()
 }
 
-pub fn wireframe(doc: &WorkflowDocument) -> String {
+fn wireframe(doc: &WorkflowDocument) -> String {
     let mut lines = vec!["flowchart TD".to_owned()];
     for node in &doc.nodes {
         let id = node.id();
