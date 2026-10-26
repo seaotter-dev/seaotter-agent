@@ -259,24 +259,18 @@ fn wireframe(doc: &WorkflowDocument) -> String {
     let mut lines = vec!["flowchart TD".to_owned()];
     for node in &doc.nodes {
         let id = node.id();
-        let label = match node {
-            DocumentNode::Decide { questions, .. } => {
-                let questions = questions
-                    .keys()
-                    .map(String::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{id} decide {questions}")
-            }
-            DocumentNode::Generate { task, gate, .. } => {
-                let mut label = format!("{id} generate {task}");
-                if let Some(gate) = gate {
-                    label.push_str(&format!(" allow {}", gate.allow));
-                }
-                label
-            }
-            DocumentNode::Effect { name, .. } => format!("{id} effect {name}"),
+        let kind = match node {
+            DocumentNode::Decide { .. } => "decide",
+            DocumentNode::Generate { .. } => "generate",
+            DocumentNode::Effect { .. } => "effect",
         };
+        let mut label = format!("{id} {kind}");
+        if let DocumentNode::Generate {
+            gate: Some(gate), ..
+        } = node
+        {
+            label.push_str(&format!(" allow {}", gate.allow));
+        }
         lines.push(format!("  {id}[\"{}\"]", escape_label(&label)));
     }
     for edge in &doc.edges {
