@@ -244,3 +244,54 @@ Tracked in Linear under the [Production run checks](https://linear.app/seaotter-
 4. Anomaly
    * SEA-420 Report an anomaly and append it as a signal
    * SEA-421 Check drift and anomaly at the end of a document run
+
+## Goal (terminal agent)
+
+The default command is a terminal agent in the current directory. Rust owns the turn. System One chooses one action: read, search, edit, shell, reply, or stop. System Two runs only for reply and edit. A request carries no tool list. Low confidence does not run shell.
+
+`AGENTS.md` in the working directory is the only context file. A session is JSONL for that directory. `--print`, `--mode json`, and `--mode rpc` are the automation surfaces. TypeScript and Python spawn the Rust binary. They do not contain the loop. Docker remains an optional non-root isolator.
+
+`--workflow` still runs `examples/ticket-router`, `examples/gated-generate`, and `examples/effects`. The MCP server and the Mermaid wireframe stay.
+
+The issues listed under [terminal agent slices](#terminal-agent-slices) are this phase's work breakdown. Stay inside the non-goals.
+
+## Non-goals (terminal agent)
+
+* A visual workflow
+* An in-process extension runtime
+* A canvas
+* A catalog chat
+* A skill marketplace
+* A theme engine
+
+## Terminal agent acceptance
+
+* The default command is a terminal agent in the current directory.
+* System One chooses the action.
+* System Two runs only for reply and edit.
+* Non-goals name a visual workflow and an in-process extension runtime.
+* The MCP server and the Mermaid wireframe stay.
+* `--workflow` still runs the three examples.
+
+## Terminal agent slices
+
+Tracked in Linear under the [Terminal agent](https://linear.app/seaotter-dev/project/terminal-agent-f8ebfc6f630d) project.
+
+1. Spec
+   * SEA-422 Land the terminal-agent spec
+2. Terminal
+   * SEA-429 Open a terminal session
+   * SEA-427 Read AGENTS.md
+3. Ensemble loop
+   * SEA-424 Choose the next action with System One
+   * SEA-423 Call System Two only to write
+   * SEA-425 Keep effects inside the workspace
+4. Sessions
+   * SEA-426 Save a session tree
+   * SEA-428 Compact the active branch
+5. Automation and SDKs
+   * SEA-430 Print and JSON modes
+   * SEA-431 Serve RPC on stdin
+   * SEA-432 TypeScript SDK
+   * SEA-433 Python SDK
+   * SEA-434 Run the agent in Docker
