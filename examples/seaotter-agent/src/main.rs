@@ -1,5 +1,8 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::time::SystemTime;
+
+use serde::{Deserialize, Serialize};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -13,7 +16,47 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            print!("{}", session(&dir));
+            match start_session(&dir) {
+                Ok(text) => print!("{text}"),
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            return ExitCode::SUCCESS;
+        }
+        Ok(Request::Continue) => {
+            let dir = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match continue_session(&dir) {
+                Ok(text) => print!("{text}"),
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            return ExitCode::SUCCESS;
+        }
+        Ok(Request::Print(message)) => {
+            print!("{}", print_reply(message));
+            return ExitCode::SUCCESS;
+        }
+        Ok(Request::Json(message)) => {
+            print!("{}", json_events(message));
+            return ExitCode::SUCCESS;
+        }
+        Ok(Request::Rpc) => {
+            let stdin = std::io::stdin();
+            let mut stdout = std::io::stdout().lock();
+            if let Err(err) = serve_rpc_stream(stdin.lock(), &mut stdout) {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
             return ExitCode::SUCCESS;
         }
         Ok(Request::Workflow(workflow, bin, rest)) => (workflow, bin, rest),
@@ -42,6 +85,10 @@ fn main() -> ExitCode {
 enum Request<'a> {
     Health,
     Session,
+    Continue,
+    Print(&'a str),
+    Json(&'a str),
+    Rpc,
     Workflow(&'a str, &'static str, &'a [String]),
 }
 
@@ -52,8 +99,149 @@ fn parse(args: &[String]) -> Result<Request<'_>, String> {
     if args.len() == 1 && args[0] == "--health" {
         return Ok(Request::Health);
     }
+    if args.len() == 1 && args[0] == "--continue" {
+        return Ok(Request::Continue);
+    }
+    if let Some(request) = parse_output(args)? {
+        return Ok(request);
+    }
     let (workflow, bin, rest) = parse_workflow(args)?;
     Ok(Request::Workflow(workflow, bin, rest))
+}
+
+fn parse_output(args: &[String]) -> Result<Option<Request<'_>>, String> {
+    match args.first().map(String::as_str) {
+        Some("--print") => {
+            if args.len() == 1 {
+                return Err("--print needs a message".into());
+            }
+            if args.len() != 2 {
+                return Err("--print takes one message".into());
+            }
+            Ok(Some(Request::Print(&args[1])))
+        }
+        Some("--mode") => {
+            let mode = args.get(1).ok_or("--mode needs json")?;
+            match mode.as_str() {
+                "json" => {
+                    if args.len() == 2 {
+                        return Err("--mode json needs a message".into());
+                    }
+                    if args.len() != 3 {
+                        return Err("--mode json takes one message".into());
+                    }
+                    Ok(Some(Request::Json(&args[2])))
+                }
+                "rpc" => {
+                    if args.len() != 2 {
+                        return Err("--mode rpc takes no message".into());
+                    }
+                    Ok(Some(Request::Rpc))
+                }
+                other => Err(format!("unknown mode `{other}`")),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn print_reply(message: &str) -> String {
+    format!("{message}\n")
+}
+
+fn json_events(message: &str) -> String {
+    let decision = serde_json::json!({"kind": "decision", "action": "read"});
+    let effect = serde_json::json!({"kind": "effect", "name": "read"});
+    let reply = serde_json::json!({"kind": "reply", "text": message});
+    format!(
+        "{}\n{}\n{}\n",
+        serde_json::to_string(&decision).expect("decision"),
+        serde_json::to_string(&effect).expect("effect"),
+        serde_json::to_string(&reply).expect("reply"),
+    )
+}
+
+enum RpcStep {
+    Continue(String),
+    Stop(String),
+}
+
+#[cfg(test)]
+fn serve_rpc(input: &str) -> String {
+    let mut out = Vec::new();
+    serve_rpc_stream(std::io::Cursor::new(input), &mut out).expect("rpc");
+    String::from_utf8(out).expect("rpc")
+}
+
+fn serve_rpc_stream(
+    input: impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let mut remembered = None;
+    for line in input.lines() {
+        let line = line.map_err(|err| err.to_string())?;
+        if line.is_empty() {
+            continue;
+        }
+        let step = command_output(&line, &mut remembered);
+        let stop = matches!(step, RpcStep::Stop(_));
+        let text = match step {
+            RpcStep::Continue(text) | RpcStep::Stop(text) => text,
+        };
+        output
+            .write_all(text.as_bytes())
+            .map_err(|err| err.to_string())?;
+        output.flush().map_err(|err| err.to_string())?;
+        if stop {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn command_output(line: &str, remembered: &mut Option<String>) -> RpcStep {
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => return RpcStep::Stop(response_error(None, &err.to_string())),
+    };
+    let command = value.get("command").and_then(|command| command.as_str());
+    match command {
+        Some("prompt") => match value.get("message").and_then(|message| message.as_str()) {
+            Some(message) => {
+                remembered.replace(message.to_string());
+                RpcStep::Continue(events_and_response(message, "prompt"))
+            }
+            None => RpcStep::Continue(response_error(Some("prompt"), "message")),
+        },
+        Some("continue") => match remembered.clone() {
+            Some(message) => RpcStep::Continue(events_and_response(&message, "continue")),
+            None => RpcStep::Continue(response_error(Some("continue"), "no prompt")),
+        },
+        Some("abort") => RpcStep::Stop(response_line("abort")),
+        Some(other) => RpcStep::Stop(response_error(None, &format!("unknown command `{other}`"))),
+        None => RpcStep::Stop(response_error(None, "missing command")),
+    }
+}
+
+fn events_and_response(message: &str, command: &str) -> String {
+    let mut text = json_events(message);
+    text.push_str(&response_line(command));
+    text
+}
+
+fn response_line(command: &str) -> String {
+    let value = serde_json::json!({"kind": "response", "command": command});
+    format!("{}\n", serde_json::to_string(&value).expect("response"))
+}
+
+fn response_error(command: Option<&str>, error: &str) -> String {
+    let value = match command {
+        Some(command) => {
+            serde_json::json!({"kind": "response", "command": command, "error": error})
+        }
+        None => serde_json::json!({"kind": "response", "error": error}),
+    };
+    format!("{}\n", serde_json::to_string(&value).expect("response"))
 }
 
 fn system_prompt(dir: &Path) -> String {
@@ -69,6 +257,190 @@ fn session(dir: &Path) -> String {
     } else {
         format!("{}\n{prompt}\n> \n", dir.display())
     }
+}
+
+const CONTEXT_LIMIT: usize = 1024;
+const SUMMARY_MAX: usize = 256;
+const RECENT_TURNS: usize = 2;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Entry {
+    id: String,
+    parent: Option<String>,
+    text: String,
+}
+
+fn start_session(dir: &Path) -> Result<String, String> {
+    let text = session(dir);
+    let sessions = sessions_dir(dir);
+    std::fs::create_dir_all(&sessions)
+        .map_err(|err| format!("creating {}: {err}", sessions.display()))?;
+    let path = sessions.join(format!("{}.jsonl", session_file_id()));
+    let entry = Entry {
+        id: "1".into(),
+        parent: None,
+        text: text.clone(),
+    };
+    let line = serde_json::to_string(&entry).map_err(|err| err.to_string())?;
+    std::fs::write(&path, format!("{line}\n"))
+        .map_err(|err| format!("writing {}: {err}", path.display()))?;
+    Ok(text)
+}
+
+fn continue_session(dir: &Path) -> Result<String, String> {
+    let path = newest_session(dir)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|err| format!("reading {}: {err}", path.display()))?;
+    let mut entries = parse_entries(&path, &raw)?;
+    let added = compact(&entries)?;
+    if !added.is_empty() {
+        append_entries(&path, &raw, &added)?;
+        entries.extend(added);
+    }
+    let branch = active_branch(&entries)?;
+    Ok(branch.into_iter().map(|entry| entry.text).collect())
+}
+
+fn parse_entries(path: &Path, raw: &str) -> Result<Vec<Entry>, String> {
+    let mut entries = Vec::new();
+    for (index, line) in raw.lines().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let entry = serde_json::from_str::<Entry>(line)
+            .map_err(|err| format!("{}:{}: {err}", path.display(), index + 1))?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn append_entries(path: &Path, raw: &str, added: &[Entry]) -> Result<(), String> {
+    let mut extra = String::new();
+    if !raw.is_empty() && !raw.ends_with('\n') {
+        extra.push('\n');
+    }
+    for entry in added {
+        let line = serde_json::to_string(entry).map_err(|err| err.to_string())?;
+        extra.push_str(&line);
+        extra.push('\n');
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("writing {}: {err}", path.display()))?;
+    std::io::Write::write_all(&mut file, extra.as_bytes())
+        .map_err(|err| format!("writing {}: {err}", path.display()))
+}
+
+fn sessions_dir(dir: &Path) -> PathBuf {
+    dir.join(".seaotter").join("sessions")
+}
+
+fn session_file_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}-{n}")
+}
+
+fn newest_session(dir: &Path) -> Result<PathBuf, String> {
+    let sessions = sessions_dir(dir);
+    let entries = std::fs::read_dir(&sessions).map_err(|_| "no session".to_string())?;
+    let mut best: Option<(SystemTime, PathBuf)> = None;
+    for entry in entries {
+        let entry = entry.map_err(|err| err.to_string())?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map_err(|err| err.to_string())?;
+        let replace = match &best {
+            Some((time, previous)) => modified > *time || (modified == *time && path > *previous),
+            None => true,
+        };
+        if replace {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
+        .ok_or_else(|| "no session".into())
+}
+
+fn active_branch(entries: &[Entry]) -> Result<Vec<Entry>, String> {
+    let tip = entries.last().ok_or_else(|| "no session".to_string())?;
+    let mut chain = Vec::new();
+    let mut current = Some(tip.id.clone());
+    while let Some(id) = current {
+        if chain.len() > entries.len() {
+            return Err("session cycle".into());
+        }
+        let entry = entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .ok_or_else(|| format!("missing session entry `{id}`"))?;
+        current = entry.parent.clone();
+        chain.push(entry.clone());
+    }
+    chain.reverse();
+    Ok(chain)
+}
+
+fn compact(entries: &[Entry]) -> Result<Vec<Entry>, String> {
+    let branch = active_branch(entries)?;
+    if branch.len() < 2 || branch_chars(&branch) <= CONTEXT_LIMIT {
+        return Ok(Vec::new());
+    }
+    let recent_count = RECENT_TURNS.min(branch.len() - 1);
+    let split = branch.len() - recent_count;
+    let older = &branch[..split];
+    let recent = &branch[split..];
+    if older.len() == 1 && branch_chars(older) <= SUMMARY_MAX {
+        return Ok(Vec::new());
+    }
+    let mut next = next_numeric_id(entries);
+    let summary_id = next.to_string();
+    let mut added = vec![Entry {
+        id: summary_id.clone(),
+        parent: older[0].parent.clone(),
+        text: summary_text(older),
+    }];
+    let mut parent = summary_id;
+    for turn in recent {
+        next += 1;
+        let id = next.to_string();
+        added.push(Entry {
+            id: id.clone(),
+            parent: Some(parent),
+            text: turn.text.clone(),
+        });
+        parent = id;
+    }
+    Ok(added)
+}
+
+fn branch_chars(entries: &[Entry]) -> usize {
+    entries.iter().map(|entry| entry.text.chars().count()).sum()
+}
+
+fn summary_text(older: &[Entry]) -> String {
+    let joined: String = older.iter().map(|entry| entry.text.as_str()).collect();
+    joined.chars().take(SUMMARY_MAX).collect()
+}
+
+fn next_numeric_id(entries: &[Entry]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|entry| entry.id.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 fn ensure_workspace(root: &Path) -> Result<(), String> {
@@ -93,7 +465,10 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, ensure_workspace, parse, session, system_prompt};
+    use super::{
+        Entry, Request, active_branch, continue_session, ensure_workspace, json_events, parse,
+        print_reply, serve_rpc, session, start_session, system_prompt,
+    };
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(str::to_string).collect()
@@ -169,6 +544,199 @@ mod tests {
     }
 
     #[test]
+    fn a_new_session_is_one_jsonl_line() {
+        let dir = std::env::temp_dir().join(format!("seaotter-jsonl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let text = start_session(&dir).unwrap();
+        assert_eq!(text, session(&dir));
+        let mut files = std::fs::read_dir(dir.join(".seaotter/sessions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let raw = std::fs::read_to_string(files.pop().unwrap()).unwrap();
+        let lines = raw
+            .lines()
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 1);
+        let entry: Entry = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(entry.parent, None);
+        assert_eq!(entry.text, text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn continue_parses_and_a_missing_session_fails() {
+        assert!(matches!(
+            parse(&args(&["--continue"])).unwrap(),
+            Request::Continue
+        ));
+        let dir = std::env::temp_dir().join(format!("seaotter-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let err = continue_session(&dir).unwrap_err();
+        assert!(err.contains("session"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_fork_leaves_the_sibling_off_the_active_branch() {
+        let dir = std::env::temp_dir().join(format!("seaotter-fork-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sessions = dir.join(".seaotter/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let older = sessions.join("older.jsonl");
+        let newer = sessions.join("newer.jsonl");
+        std::fs::write(
+            &older,
+            "{\"id\":\"1\",\"parent\":null,\"text\":\"old session\\n\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &newer,
+            concat!(
+                "{\"id\":\"1\",\"parent\":null,\"text\":\"root\\n\"}\n",
+                "{\"id\":\"2\",\"parent\":\"1\",\"text\":\"sibling\\n\"}\n",
+                "{\"id\":\"3\",\"parent\":\"1\",\"text\":\"tip\\n\"}\n",
+            ),
+        )
+        .unwrap();
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(epoch + std::time::Duration::from_secs(1))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&newer)
+            .unwrap()
+            .set_modified(epoch + std::time::Duration::from_secs(2))
+            .unwrap();
+        let text = continue_session(&dir).unwrap();
+        assert_eq!(text, "root\ntip\n");
+        assert!(!text.contains("sibling"), "{text}");
+        assert!(!text.contains("old session"), "{text}");
+        let entries = vec![
+            Entry {
+                id: "1".into(),
+                parent: None,
+                text: "root\n".into(),
+            },
+            Entry {
+                id: "2".into(),
+                parent: Some("1".into()),
+                text: "sibling\n".into(),
+            },
+            Entry {
+                id: "3".into(),
+                parent: Some("1".into()),
+                text: "tip\n".into(),
+            },
+        ];
+        let branch = active_branch(&entries).unwrap();
+        assert_eq!(
+            branch
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "3"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn entry_line(id: &str, parent: Option<&str>, text: &str) -> String {
+        let entry = Entry {
+            id: id.into(),
+            parent: parent.map(str::to_string),
+            text: text.into(),
+        };
+        format!("{}\n", serde_json::to_string(&entry).unwrap())
+    }
+
+    fn write_session(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let sessions = dir.join(".seaotter/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_short_branch_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("seaotter-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let body = format!(
+            "{}{}",
+            entry_line("1", None, "root\n"),
+            entry_line("2", Some("1"), "tip\n"),
+        );
+        let path = write_session(&dir, "session.jsonl", &body);
+        let text = continue_session(&dir).unwrap();
+        assert_eq!(text, "root\ntip\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_branch_keeps_recent_turns_and_the_original_lines() {
+        let dir = std::env::temp_dir().join(format!("seaotter-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let older_a = "a".repeat(200);
+        let older_b = format!("{}PAST-CUT", "b".repeat(100));
+        let recent_a = format!("{}RECENT-A", "r".repeat(400));
+        let recent_b = format!("{}RECENT-B", "s".repeat(400));
+        let body = format!(
+            "{}{}{}{}{}",
+            entry_line("1", None, &older_a),
+            entry_line("2", Some("1"), &older_b),
+            entry_line("3", Some("1"), "SIBLING\n"),
+            entry_line("4", Some("2"), &recent_a),
+            entry_line("5", Some("4"), &recent_b),
+        );
+        let path = write_session(&dir, "session.jsonl", &body);
+        let text = continue_session(&dir).unwrap();
+        assert!(text.contains("RECENT-A"), "{text}");
+        assert!(text.contains("RECENT-B"), "{text}");
+        assert!(!text.contains("PAST-CUT"), "{text}");
+        assert!(!text.contains("SIBLING"), "{text}");
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(stored.starts_with(&body), "{stored}");
+        let added = stored[body.len()..]
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str::<Entry>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(added.len(), 3, "{added:?}");
+        assert!(added[0].text.chars().count() <= 256, "{}", added[0].text);
+        assert!(!added[0].text.contains("PAST-CUT"));
+        assert_eq!(added[1].text, recent_a);
+        assert_eq!(added[2].text, recent_b);
+        assert_eq!(added[2].parent.as_deref(), Some(added[1].id.as_str()));
+        let again = std::fs::read_to_string(&path).unwrap();
+        let second = continue_session(&dir).unwrap();
+        assert_eq!(second, text);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_oversized_entry_is_not_rewritten() {
+        let dir = std::env::temp_dir().join(format!("seaotter-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = "x".repeat(2000);
+        let body = entry_line("1", None, &text);
+        let path = write_session(&dir, "session.jsonl", &body);
+        let printed = continue_session(&dir).unwrap();
+        assert_eq!(printed, text);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn workflow_without_a_name_still_fails() {
         let err = parse(&args(&["--workflow"])).unwrap_err();
         assert!(err.contains("name"), "{err}");
@@ -183,6 +751,135 @@ mod tests {
         assert_eq!(workflow, "examples/effects");
         assert_eq!(bin, "effects");
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn print_writes_the_message_and_needs_one() {
+        let printed = args(&["--print", "hello"]);
+        let Request::Print(message) = parse(&printed).unwrap() else {
+            panic!("expected print");
+        };
+        assert_eq!(message, "hello");
+        assert_eq!(print_reply(message), "hello\n");
+        let err = parse(&args(&["--print"])).unwrap_err();
+        assert!(err.contains("message"), "{err}");
+        let err = parse(&args(&["--print", "hello", "extra"])).unwrap_err();
+        assert!(err.contains("message"), "{err}");
+    }
+
+    #[test]
+    fn json_mode_writes_three_events() {
+        let json = args(&["--mode", "json", "hello"]);
+        let Request::Json(message) = parse(&json).unwrap() else {
+            panic!("expected json");
+        };
+        assert_eq!(message, "hello");
+        let stream = json_events(message);
+        let lines: Vec<_> = stream.lines().collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let decision: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let effect: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(decision["kind"], "decision");
+        assert_eq!(decision["action"], "read");
+        assert_eq!(effect["kind"], "effect");
+        assert_eq!(effect["name"], "read");
+        assert!(effect.get("output").is_none());
+        assert_eq!(reply["kind"], "reply");
+        assert_eq!(reply["text"], "hello");
+        let err = parse(&args(&["--mode"])).unwrap_err();
+        assert!(err.contains("json"), "{err}");
+        assert!(matches!(
+            parse(&args(&["--mode", "rpc"])).unwrap(),
+            Request::Rpc
+        ));
+        let err = parse(&args(&["--mode", "rpc", "extra"])).unwrap_err();
+        assert!(err.contains("message"), "{err}");
+        let err = parse(&args(&["--mode", "other"])).unwrap_err();
+        assert!(err.contains("other"), "{err}");
+    }
+
+    fn rpc_lines(input: &str) -> Vec<serde_json::Value> {
+        serve_rpc(input)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn rpc_prompt_writes_events_and_a_response() {
+        let lines = rpc_lines(r#"{"command":"prompt","message":"hello"}"#);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0]["kind"], "decision");
+        assert_eq!(lines[0]["action"], "read");
+        assert_eq!(lines[1]["kind"], "effect");
+        assert_eq!(lines[1]["name"], "read");
+        assert_eq!(lines[2]["kind"], "reply");
+        assert_eq!(lines[2]["text"], "hello");
+        assert_eq!(lines[3]["kind"], "response");
+        assert_eq!(lines[3]["command"], "prompt");
+        let missing = rpc_lines(r#"{"command":"prompt"}"#);
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert_eq!(missing[0]["error"], "message");
+        assert!(missing[0].get("text").is_none());
+    }
+
+    #[test]
+    fn rpc_continue_repeats_the_prompt_or_reports_none() {
+        let lines = rpc_lines(
+            "{\"command\":\"prompt\",\"message\":\"hello\"}\n{\"command\":\"continue\"}\n",
+        );
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        assert_eq!(lines[6]["kind"], "reply");
+        assert_eq!(lines[6]["text"], "hello");
+        assert_eq!(lines[7]["kind"], "response");
+        assert_eq!(lines[7]["command"], "continue");
+        let missing = rpc_lines(
+            "{\"command\":\"continue\"}\n{\"command\":\"prompt\",\"message\":\"later\"}\n",
+        );
+        assert_eq!(missing[0]["error"], "no prompt");
+        assert!(
+            missing
+                .iter()
+                .take(1)
+                .all(|line| line["kind"] != "decision")
+        );
+        assert_eq!(missing[1]["kind"], "decision");
+        assert_eq!(missing.last().unwrap()["command"], "prompt");
+    }
+
+    #[test]
+    fn rpc_abort_stops_before_the_next_command() {
+        let lines =
+            rpc_lines("{\"command\":\"abort\"}\n{\"command\":\"prompt\",\"message\":\"later\"}\n");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["kind"], "response");
+        assert_eq!(lines[0]["command"], "abort");
+        assert!(
+            !serve_rpc("{\"command\":\"abort\"}\n{\"command\":\"prompt\",\"message\":\"later\"}\n")
+                .contains("later")
+        );
+    }
+
+    #[test]
+    fn rpc_does_not_write_a_session() {
+        let dir = std::env::temp_dir().join(format!("seaotter-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = serve_rpc(r#"{"command":"prompt","message":"hello"}"#);
+        assert!(!dir.join(".seaotter").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn print_and_json_do_not_write_a_session() {
+        let dir = std::env::temp_dir().join(format!("seaotter-print-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(print_reply("hello"), "hello\n");
+        assert!(json_events("hello").contains("\"kind\":\"reply\""));
+        assert!(!dir.join(".seaotter").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
