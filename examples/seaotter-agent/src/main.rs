@@ -101,6 +101,10 @@ fn session(dir: &Path) -> String {
     }
 }
 
+const CONTEXT_LIMIT: usize = 1024;
+const SUMMARY_MAX: usize = 256;
+const RECENT_TURNS: usize = 2;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct Entry {
     id: String,
@@ -129,6 +133,17 @@ fn continue_session(dir: &Path) -> Result<String, String> {
     let path = newest_session(dir)?;
     let raw = std::fs::read_to_string(&path)
         .map_err(|err| format!("reading {}: {err}", path.display()))?;
+    let mut entries = parse_entries(&path, &raw)?;
+    let added = compact(&entries)?;
+    if !added.is_empty() {
+        append_entries(&path, &raw, &added)?;
+        entries.extend(added);
+    }
+    let branch = active_branch(&entries)?;
+    Ok(branch.into_iter().map(|entry| entry.text).collect())
+}
+
+fn parse_entries(path: &Path, raw: &str) -> Result<Vec<Entry>, String> {
     let mut entries = Vec::new();
     for (index, line) in raw.lines().enumerate() {
         if line.is_empty() {
@@ -138,8 +153,25 @@ fn continue_session(dir: &Path) -> Result<String, String> {
             .map_err(|err| format!("{}:{}: {err}", path.display(), index + 1))?;
         entries.push(entry);
     }
-    let branch = active_branch(&entries)?;
-    Ok(branch.into_iter().map(|entry| entry.text).collect())
+    Ok(entries)
+}
+
+fn append_entries(path: &Path, raw: &str, added: &[Entry]) -> Result<(), String> {
+    let mut extra = String::new();
+    if !raw.is_empty() && !raw.ends_with('\n') {
+        extra.push('\n');
+    }
+    for entry in added {
+        let line = serde_json::to_string(entry).map_err(|err| err.to_string())?;
+        extra.push_str(&line);
+        extra.push('\n');
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|err| format!("writing {}: {err}", path.display()))?;
+    std::io::Write::write_all(&mut file, extra.as_bytes())
+        .map_err(|err| format!("writing {}: {err}", path.display()))
 }
 
 fn sessions_dir(dir: &Path) -> PathBuf {
@@ -200,6 +232,57 @@ fn active_branch(entries: &[Entry]) -> Result<Vec<Entry>, String> {
     }
     chain.reverse();
     Ok(chain)
+}
+
+fn compact(entries: &[Entry]) -> Result<Vec<Entry>, String> {
+    let branch = active_branch(entries)?;
+    if branch.len() < 2 || branch_chars(&branch) <= CONTEXT_LIMIT {
+        return Ok(Vec::new());
+    }
+    let recent_count = RECENT_TURNS.min(branch.len() - 1);
+    let split = branch.len() - recent_count;
+    let older = &branch[..split];
+    let recent = &branch[split..];
+    if older.len() == 1 && branch_chars(older) <= SUMMARY_MAX {
+        return Ok(Vec::new());
+    }
+    let mut next = next_numeric_id(entries);
+    let summary_id = next.to_string();
+    let mut added = vec![Entry {
+        id: summary_id.clone(),
+        parent: older[0].parent.clone(),
+        text: summary_text(older),
+    }];
+    let mut parent = summary_id;
+    for turn in recent {
+        next += 1;
+        let id = next.to_string();
+        added.push(Entry {
+            id: id.clone(),
+            parent: Some(parent),
+            text: turn.text.clone(),
+        });
+        parent = id;
+    }
+    Ok(added)
+}
+
+fn branch_chars(entries: &[Entry]) -> usize {
+    entries.iter().map(|entry| entry.text.chars().count()).sum()
+}
+
+fn summary_text(older: &[Entry]) -> String {
+    let joined: String = older.iter().map(|entry| entry.text.as_str()).collect();
+    joined.chars().take(SUMMARY_MAX).collect()
+}
+
+fn next_numeric_id(entries: &[Entry]) -> u64 {
+    entries
+        .iter()
+        .filter_map(|entry| entry.id.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 fn ensure_workspace(root: &Path) -> Result<(), String> {
@@ -404,6 +487,94 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["1", "3"]
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn entry_line(id: &str, parent: Option<&str>, text: &str) -> String {
+        let entry = Entry {
+            id: id.into(),
+            parent: parent.map(str::to_string),
+            text: text.into(),
+        };
+        format!("{}\n", serde_json::to_string(&entry).unwrap())
+    }
+
+    fn write_session(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+        let sessions = dir.join(".seaotter/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let path = sessions.join(name);
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_short_branch_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("seaotter-short-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let body = format!(
+            "{}{}",
+            entry_line("1", None, "root\n"),
+            entry_line("2", Some("1"), "tip\n"),
+        );
+        let path = write_session(&dir, "session.jsonl", &body);
+        let text = continue_session(&dir).unwrap();
+        assert_eq!(text, "root\ntip\n");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_branch_keeps_recent_turns_and_the_original_lines() {
+        let dir = std::env::temp_dir().join(format!("seaotter-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let older_a = "a".repeat(200);
+        let older_b = format!("{}PAST-CUT", "b".repeat(100));
+        let recent_a = format!("{}RECENT-A", "r".repeat(400));
+        let recent_b = format!("{}RECENT-B", "s".repeat(400));
+        let body = format!(
+            "{}{}{}{}{}",
+            entry_line("1", None, &older_a),
+            entry_line("2", Some("1"), &older_b),
+            entry_line("3", Some("1"), "SIBLING\n"),
+            entry_line("4", Some("2"), &recent_a),
+            entry_line("5", Some("4"), &recent_b),
+        );
+        let path = write_session(&dir, "session.jsonl", &body);
+        let text = continue_session(&dir).unwrap();
+        assert!(text.contains("RECENT-A"), "{text}");
+        assert!(text.contains("RECENT-B"), "{text}");
+        assert!(!text.contains("PAST-CUT"), "{text}");
+        assert!(!text.contains("SIBLING"), "{text}");
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(stored.starts_with(&body), "{stored}");
+        let added = stored[body.len()..]
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str::<Entry>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(added.len(), 3, "{added:?}");
+        assert!(added[0].text.chars().count() <= 256, "{}", added[0].text);
+        assert!(!added[0].text.contains("PAST-CUT"));
+        assert_eq!(added[1].text, recent_a);
+        assert_eq!(added[2].text, recent_b);
+        assert_eq!(added[2].parent.as_deref(), Some(added[1].id.as_str()));
+        let again = std::fs::read_to_string(&path).unwrap();
+        let second = continue_session(&dir).unwrap();
+        assert_eq!(second, text);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn one_oversized_entry_is_not_rewritten() {
+        let dir = std::env::temp_dir().join(format!("seaotter-one-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = "x".repeat(2000);
+        let body = entry_line("1", None, &text);
+        let path = write_session(&dir, "session.jsonl", &body);
+        let printed = continue_session(&dir).unwrap();
+        assert_eq!(printed, text);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
