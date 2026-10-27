@@ -1,3 +1,4 @@
+use std::io::{IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Mutex;
@@ -27,7 +28,8 @@ fn main() -> ExitCode {
             let stdin = std::io::stdin();
             let mut stdout = std::io::stdout().lock();
             let turn = OfflineTurn::new(dir.clone());
-            if let Err(err) = read_prompt(&dir, stdin.lock(), &mut stdout, &turn, &turn) {
+            let terminal = stdout.is_terminal();
+            if let Err(err) = read_prompt(&dir, stdin.lock(), &mut stdout, &turn, &turn, terminal) {
                 eprintln!("{err}");
                 return ExitCode::FAILURE;
             }
@@ -295,33 +297,195 @@ fn start_session(dir: &Path) -> Result<String, String> {
     Ok(text)
 }
 
+#[derive(Clone, Copy)]
+enum Role {
+    Person,
+    Tool,
+    Reply,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Role::Person => "person",
+            Role::Tool => "tool",
+            Role::Reply => "reply",
+        }
+    }
+}
+
+struct TranscriptLine {
+    role: Role,
+    text: String,
+}
+
+struct Screen {
+    rows: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+fn layout(header: &[String], lines: &[TranscriptLine], height: usize, prompt: &str) -> Screen {
+    let mut content: Vec<String> = header.to_vec();
+    for line in lines {
+        content.push(format!("{} {}", line.role.name(), line.text));
+    }
+    let room = height.saturating_sub(1);
+    if content.len() > room {
+        content.drain(0..content.len() - room);
+    }
+    let mut rows = Vec::with_capacity(room + 1);
+    rows.extend(std::iter::repeat_with(String::new).take(room.saturating_sub(content.len())));
+    rows.extend(content);
+    rows.push(prompt.to_string());
+    Screen {
+        cursor_row: rows.len() - 1,
+        cursor_col: prompt.chars().count(),
+        rows,
+    }
+}
+
+fn header_lines(session_text: &str) -> Vec<String> {
+    let body = session_text.strip_suffix("> \n").unwrap_or(session_text);
+    body.lines().map(str::to_string).collect()
+}
+
+struct Frame<'a, W: Write> {
+    output: &'a mut W,
+    terminal: bool,
+    header: Vec<String>,
+    lines: Vec<TranscriptLine>,
+    prompt: String,
+    alternate: bool,
+}
+
+impl<'a, W: Write> Frame<'a, W> {
+    fn new(output: &'a mut W, terminal: bool) -> Self {
+        Self {
+            output,
+            terminal,
+            header: Vec::new(),
+            lines: Vec::new(),
+            prompt: "> ".into(),
+            alternate: false,
+        }
+    }
+
+    fn emit_line(&mut self, role: Role, text: &str) -> Result<(), String> {
+        let plain = if text.ends_with('\n') {
+            text.to_string()
+        } else {
+            format!("{text}\n")
+        };
+        if !self.terminal {
+            return write_prompt(self.output, &plain);
+        }
+        self.lines.push(TranscriptLine {
+            role,
+            text: text.trim_end_matches(['\r', '\n']).to_string(),
+        });
+        self.paint()
+    }
+
+    fn emit_prompt(&mut self, prompt: &str, plain: &str) -> Result<(), String> {
+        if !self.terminal {
+            return write_prompt(self.output, plain);
+        }
+        self.prompt = prompt.to_string();
+        self.paint()
+    }
+
+    fn emit_session(&mut self, text: &str) -> Result<(), String> {
+        if !self.terminal {
+            return write_prompt(self.output, text);
+        }
+        self.header = header_lines(text);
+        self.prompt = "> ".into();
+        self.paint()
+    }
+
+    fn paint(&mut self) -> Result<(), String> {
+        let height = crossterm::terminal::size()
+            .map(|(_, rows)| rows as usize)
+            .unwrap_or(24)
+            .max(1);
+        let screen = layout(&self.header, &self.lines, height, &self.prompt);
+        if !self.alternate {
+            crossterm::execute!(self.output, crossterm::terminal::EnterAlternateScreen)
+                .map_err(|err| err.to_string())?;
+            self.alternate = true;
+        }
+        crossterm::execute!(
+            self.output,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+            crossterm::cursor::MoveTo(0, 0),
+        )
+        .map_err(|err| err.to_string())?;
+        for (index, row) in screen.rows.iter().enumerate() {
+            if index + 1 == screen.rows.len() {
+                write!(self.output, "{row}").map_err(|err| err.to_string())?;
+            } else {
+                writeln!(self.output, "{row}").map_err(|err| err.to_string())?;
+            }
+        }
+        crossterm::execute!(
+            self.output,
+            crossterm::cursor::MoveTo(screen.cursor_col as u16, screen.cursor_row as u16),
+        )
+        .map_err(|err| err.to_string())?;
+        self.output.flush().map_err(|err| err.to_string())
+    }
+
+    fn leave(&mut self) {
+        if !self.alternate {
+            return;
+        }
+        let _ = crossterm::execute!(self.output, crossterm::terminal::LeaveAlternateScreen);
+        self.alternate = false;
+    }
+}
+
 fn read_prompt(
     dir: &Path,
     mut input: impl std::io::BufRead,
-    output: &mut impl std::io::Write,
+    output: &mut impl Write,
     model: &dyn DecisionModel,
     writer: &dyn GenerativeModel,
+    terminal: bool,
 ) -> Result<(), String> {
-    mark_interrupted(dir, output)?;
+    let mut frame = Frame::new(output, terminal);
+    let result = read_prompt_with(dir, &mut input, model, writer, &mut frame);
+    frame.leave();
+    result
+}
+
+fn read_prompt_with<W: Write>(
+    dir: &Path,
+    input: &mut impl std::io::BufRead,
+    model: &dyn DecisionModel,
+    writer: &dyn GenerativeModel,
+    frame: &mut Frame<'_, W>,
+) -> Result<(), String> {
+    mark_interrupted(dir, frame)?;
     let text = start_session(dir)?;
-    write_prompt(output, &text)?;
+    frame.emit_session(&text)?;
     loop {
-        let Some(line) = read_one(&mut input)? else {
+        let Some(line) = read_one(input)? else {
             return Ok(());
         };
         if line.is_empty() {
-            write_prompt(output, "> \n")?;
+            frame.emit_prompt("> ", "> \n")?;
             continue;
         }
         if line == "/quit" {
             return Ok(());
         }
         append_line(dir, &line)?;
-        write_prompt(output, &format!("{line}\n"))?;
-        if let Err(err) = run_turn(dir, &line, &mut input, model, writer, output) {
+        frame.emit_line(Role::Person, &line)?;
+        if let Err(err) = run_turn(dir, &line, input, model, writer, frame) {
             eprintln!("{err}");
         }
-        write_prompt(output, "> \n")?;
+        frame.emit_prompt("> ", "> \n")?;
     }
 }
 
@@ -340,7 +504,7 @@ fn read_one(input: &mut impl std::io::BufRead) -> Result<Option<String>, String>
     Ok(Some(buf))
 }
 
-fn mark_interrupted(dir: &Path, output: &mut impl std::io::Write) -> Result<(), String> {
+fn mark_interrupted<W: Write>(dir: &Path, frame: &mut Frame<'_, W>) -> Result<(), String> {
     let path = match newest_session(dir) {
         Ok(path) => path,
         Err(err) if err == "no session" => return Ok(()),
@@ -356,7 +520,7 @@ fn mark_interrupted(dir: &Path, output: &mut impl std::io::Write) -> Result<(), 
         return Ok(());
     }
     append_line(dir, "interrupted")?;
-    write_prompt(output, "interrupted\n")
+    frame.emit_line(Role::Tool, "interrupted")
 }
 
 struct WatchedDecision<'a> {
@@ -453,13 +617,13 @@ impl GenerativeModel for OfflineTurn {
     }
 }
 
-fn run_turn(
+fn run_turn<W: Write>(
     dir: &Path,
     line: &str,
     input: &mut impl std::io::BufRead,
     model: &dyn DecisionModel,
     writer: &dyn GenerativeModel,
-    output: &mut impl std::io::Write,
+    frame: &mut Frame<'_, W>,
 ) -> Result<(), String> {
     let system = system_prompt(dir);
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
@@ -486,7 +650,7 @@ fn run_turn(
                     .get("bytes")
                     .and_then(Value::as_u64)
                     .ok_or_else(|| "read has no bytes".to_string())?;
-                write_prompt(output, &format!("{path} {bytes}\n"))?;
+                frame.emit_line(Role::Tool, &format!("{path} {bytes}"))?;
             }
             Action::Search => {
                 let effect = Search::new(dir).map_err(|err| err.to_string())?;
@@ -502,18 +666,14 @@ fn run_turn(
                     .filter_map(Value::as_str)
                     .collect::<Vec<_>>()
                     .join(" ");
-                write_prompt(output, &format!("{found}\n"))?;
+                frame.emit_line(Role::Tool, &found)?;
             }
             Action::Reply => {
                 let text = match step.write {
                     Some(GenOutput::Text(text)) => text,
                     _ => return Err("reply has no text".into()),
                 };
-                if text.ends_with('\n') {
-                    write_prompt(output, &text)?;
-                } else {
-                    write_prompt(output, &format!("{text}\n"))?;
-                }
+                frame.emit_line(Role::Reply, &text)?;
             }
             Action::Edit => {
                 let value = match step.write {
@@ -529,28 +689,28 @@ fn run_turn(
                     .and_then(Value::as_str)
                     .ok_or_else(|| "edit has no patch".to_string())?;
                 write_edit(dir, path, patch)?;
-                write_prompt(output, &format!("{path}\n"))?;
+                frame.emit_line(Role::Tool, path)?;
             }
             Action::Stop => {}
             Action::Shell => {
-                confirm_shell(dir, line, &system, &runtime, input, writer, output)?;
+                confirm_shell(dir, line, &system, &runtime, input, writer, frame)?;
             }
         }
     }
     if *low_shell.lock().expect("low shell") {
-        write_prompt(output, "skip\n")?;
+        frame.emit_line(Role::Tool, "skip")?;
     }
     Ok(())
 }
 
-fn confirm_shell(
+fn confirm_shell<W: Write>(
     dir: &Path,
     line: &str,
     system: &str,
     runtime: &tokio::runtime::Runtime,
     input: &mut impl std::io::BufRead,
     writer: &dyn GenerativeModel,
-    output: &mut impl std::io::Write,
+    frame: &mut Frame<'_, W>,
 ) -> Result<(), String> {
     let spec = OutputSpec::Schema(JsonSchema(json!({
         "type": "object",
@@ -601,12 +761,12 @@ fn confirm_shell(
         ));
     }
     let shown = args.join(" ");
-    write_prompt(output, &format!("{shown}\n"))?;
+    frame.emit_line(Role::Tool, &shown)?;
     append_line(dir, &format!("shell {shown}"))?;
-    write_prompt(output, "yes? ")?;
+    frame.emit_prompt("yes? ", "yes? ")?;
     let answer = read_one(input)?;
     if answer.as_deref() != Some("yes") {
-        write_prompt(output, "skipped\n")?;
+        frame.emit_line(Role::Tool, "skipped")?;
         append_line(dir, "skipped")?;
         return Ok(());
     }
@@ -625,7 +785,7 @@ fn confirm_shell(
     } else {
         stdout.trim_end_matches('\n').to_string()
     };
-    write_prompt(output, &format!("{stored}\n"))?;
+    frame.emit_line(Role::Tool, &stored)?;
     append_line(dir, &stored)
 }
 
@@ -896,8 +1056,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Entry, Request, active_branch, continue_session, ensure_workspace, json_events, parse,
-        print_reply, read_prompt, serve_rpc, session, start_session, system_prompt,
+        Entry, Request, Role, TranscriptLine, active_branch, continue_session, ensure_workspace,
+        json_events, layout, parse, print_reply, read_prompt, serve_rpc, session, start_session,
+        system_prompt,
     };
 
     struct ScriptedDecision {
@@ -1112,6 +1273,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1137,6 +1299,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1163,6 +1326,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1199,6 +1363,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1223,6 +1388,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1244,6 +1410,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1269,6 +1436,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         assert!(!outside.exists());
@@ -1295,6 +1463,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1329,6 +1498,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1355,6 +1525,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1410,6 +1581,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1431,6 +1603,7 @@ mod tests {
             &mut output,
             &model,
             &writer,
+            false,
         )
         .unwrap();
         let again = std::fs::read_to_string(&crashed).unwrap();
@@ -1633,10 +1806,69 @@ mod tests {
         };
         assert_eq!(message, "hello");
         assert_eq!(print_reply(message), "hello\n");
+        assert!(!print_reply(message).contains('\u{1b}'));
         let err = parse(&args(&["--print"])).unwrap_err();
         assert!(err.contains("message"), "{err}");
         let err = parse(&args(&["--print", "hello", "extra"])).unwrap_err();
         assert!(err.contains("message"), "{err}");
+    }
+
+    fn line(role: Role, text: &str) -> TranscriptLine {
+        TranscriptLine {
+            role,
+            text: text.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_transcript_keeps_the_prompt_on_the_last_row() {
+        let lines = vec![
+            line(Role::Person, "fix it"),
+            line(Role::Tool, "notes.txt 6"),
+            line(Role::Reply, "fixed"),
+        ];
+        let screen = layout(&[], &lines, 6, "> ");
+        let above = screen
+            .rows
+            .iter()
+            .take(screen.rows.len() - 1)
+            .filter(|row| !row.is_empty())
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            above,
+            vec![
+                "person fix it".to_string(),
+                "tool notes.txt 6".to_string(),
+                "reply fixed".to_string(),
+            ]
+        );
+        assert_eq!(screen.rows.last().map(String::as_str), Some("> "));
+        assert_eq!(screen.cursor_row, screen.rows.len() - 1);
+        assert_eq!(screen.cursor_col, 2);
+        assert_eq!(screen.rows.len(), 6);
+    }
+
+    #[test]
+    fn a_long_transcript_keeps_the_newest_lines_above_the_prompt() {
+        let lines = (1..=5)
+            .map(|n| line(Role::Person, &format!("n{n}")))
+            .collect::<Vec<_>>();
+        let screen = layout(&[], &lines, 3, "> ");
+        assert_eq!(screen.rows.len(), 3);
+        assert_eq!(screen.rows[0], "person n4");
+        assert_eq!(screen.rows[1], "person n5");
+        assert_eq!(screen.rows[2], "> ");
+        assert_eq!(screen.cursor_row, 2);
+        assert_eq!(screen.cursor_col, 2);
+    }
+
+    #[test]
+    fn the_shell_question_is_the_bottom_prompt() {
+        let screen = layout(&[], &[], 4, "yes? ");
+        assert_eq!(screen.rows.last().map(String::as_str), Some("yes? "));
+        assert_eq!(screen.cursor_row, 3);
+        assert_eq!(screen.cursor_col, 5);
     }
 
     #[test]
