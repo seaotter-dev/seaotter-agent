@@ -19,7 +19,7 @@ use crate::state::State;
 use crate::validate::validate_output;
 use crate::workflow::{Next, Outcome, Workflow};
 
-const DEFAULT_MAX_STEPS: usize = 1000;
+pub(crate) const DEFAULT_MAX_STEPS: usize = 1000;
 
 type Answers = BTreeMap<String, Answer>;
 type Decisions = BTreeMap<NodeId, Answers>;
