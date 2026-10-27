@@ -38,7 +38,7 @@ mod state;
 mod validate;
 mod workflow;
 
-pub use action::{Action, choose};
+pub use action::{Action, TurnStep, choose};
 pub use anomaly::anomaly;
 pub use catalog::{Catalog, apply_reply};
 pub use decision::{
