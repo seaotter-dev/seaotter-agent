@@ -174,7 +174,7 @@ async fn shell_denied(root: &Path) -> Result<String, String> {
 
 async fn shell_granted() -> Result<(String, Vec<Event>), String> {
     let run = machine(
-        Shell::new("/bin/echo", ["fixed"]).map_err(show)?,
+        Shell::new("/bin/echo", ["fixed"]).map_err(show)?.grant(),
         Some(Capability::DangerousShell),
     )
     .run(

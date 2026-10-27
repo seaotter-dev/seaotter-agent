@@ -16,8 +16,8 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Runs one fixed command under [`Capability::DangerousShell`]. The program,
 /// args, cwd, and environment are set in Rust when the effect is built; `run`
 /// ignores its input, so workflow state (and model output in it) can never
-/// change what executes. Output is `{"status", "stdout", "stderr"}` for any
-/// exit code.
+/// change what executes. `run` does not spawn until [`Shell::grant`] is called.
+/// Output is `{"status", "stdout", "stderr"}` for any exit code.
 ///
 /// The program runs directly, without a shell, so there is no expansion,
 /// piping, or globbing. The child starts with an empty environment plus the
@@ -29,6 +29,7 @@ pub struct Shell {
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
     env: BTreeMap<OsString, OsString>,
+    granted: bool,
     max_bytes: u64,
     timeout: Duration,
 }
@@ -57,6 +58,7 @@ impl Shell {
             args: args.into_iter().map(|a| a.as_ref().to_owned()).collect(),
             cwd: None,
             env: BTreeMap::new(),
+            granted: false,
             max_bytes: DEFAULT_MAX_BYTES,
             timeout: DEFAULT_TIMEOUT,
         })
@@ -64,6 +66,13 @@ impl Shell {
 
     pub fn named(mut self, name: impl Into<String>) -> Self {
         self.name = name.into();
+        self
+    }
+
+    /// Allows `run` to spawn. Without this call the effect returns
+    /// [`HarnessError::CapabilityDenied`] and does not start a process.
+    pub fn grant(mut self) -> Self {
+        self.granted = true;
         self
     }
 
@@ -177,6 +186,11 @@ impl Effect for Shell {
     }
 
     fn run(&self, _input: Value) -> BoxFuture<'_, Result<Value, HarnessError>> {
+        if !self.granted {
+            return Box::pin(async {
+                Err(HarnessError::CapabilityDenied(Capability::DangerousShell))
+            });
+        }
         Box::pin(self.exec())
     }
 }
