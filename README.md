@@ -1,73 +1,137 @@
 # seaotter-agent
 
-A small Rust library for code-owned agent harnesses.
+A code-owned agent harness. Rust owns the next step.
 
-## Inversion
+System One answers a typed question and returns probabilities and confidence. System Two writes only for reply and edit. Effects run in Rust after a capability grant. A request carries the state slice and the question. It carries no tool list.
 
-[Hermes](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/developer-guide/agent-loop.md) (Nous Research) and [OpenClaw](https://docs.openclaw.ai/concepts/agent-loop) both run a model-owned loop. The model sees tools, calls them, and decides when to stop. Hermes centers that loop on `AIAgent`, which can write memory and create skills. OpenClaw centers it on a gateway that loads skills into the prompt and runs an embedded agent per session.
+[SPEC.md](SPEC.md) is the contract. [DESIGN.md](DESIGN.md) compares this with a ReAct loop.
 
-This library inverts that. Code owns the next step: a Rust match or a confidence edge. System One models answer typed questions (`Choice`, `Score`, `Noul`) and return probabilities and confidence. Generative models run only inside an explicit node with a schema and `max_tokens`, usually behind a gate. Effects run in Rust after a capability grant (`FileRead`, `HttpGet`, `DangerousShell`). Requests carry the state slice and the question or task. They carry no tool list.
+Run a session in the working directory, automate it with `--print` or `--mode json`, control it over `--mode rpc`, or spawn the binary from the TypeScript or Python SDK. `--workflow` still runs the three examples. The MCP server stays.
 
-v1 is not a general agent framework. It has no skill marketplace, no model-owned memory writes, no multi-agent routing or gateway, no open tool list, and no loop where the model picks the next step.
+## Getting started
 
-* [SPEC.md](SPEC.md) is the contract.
-* [DESIGN.md](DESIGN.md) compares this with a ReAct loop.
-* [ticket-router](examples/ticket-router) routes a ticket from a typed choice.
-* [gated-generate](examples/gated-generate) drafts only after a yes/no gate.
-* [paper/](paper/) holds the measurements.
-
-## Build
+Build the command:
 
 ```sh
-cargo build --workspace
-cargo test --workspace
+cargo build -p seaotter-agent
 ```
+
+Start it in the directory where you want it to work:
+
+```sh
+cd /path/to/project
+/path/to/seaotter-agent/target/debug/seaotter-agent
+```
+
+With no arguments it prints the working directory, the text of `AGENTS.md` when that file is in the directory, and a `> ` prompt. It writes one JSONL line under `.seaotter/sessions/` and exits.
+
+```text
+/path/to/project
+the text of AGENTS.md
+>
+```
+
+`seaotter-agent --continue` prints the active branch of the newest session in that directory.
+
+## Print and JSON
+
+```sh
+seaotter-agent --print "hello"
+```
+
+writes the message and a newline:
+
+```text
+hello
+```
+
+```sh
+seaotter-agent --mode json "hello"
+```
+
+writes three JSON lines: a decision whose action is `read`, an effect record named `read`, and a reply whose text is the message. The effect line records the name. It leaves the filesystem alone.
+
+```text
+{"action":"read","kind":"decision"}
+{"kind":"effect","name":"read"}
+{"kind":"reply","text":"hello"}
+```
+
+## RPC
+
+`seaotter-agent --mode rpc` reads one JSON command per stdin line and writes events through a response line.
+
+```json
+{"command":"prompt","message":"hello"}
+{"command":"continue"}
+{"command":"abort"}
+```
+
+`prompt` writes the same three events as `--mode json`, then a response whose command is `prompt`. `continue` repeats those events for the remembered message, then a response whose command is `continue`. With no prompt yet, the response carries `error` `no prompt` and no events. `abort` writes its response and the process exits.
+
+## SDKs
+
+Both packages spawn `seaotter-agent --mode rpc` and return the event list. Neither is published, and neither contains the loop.
+
+TypeScript, in [sdks/typescript/index.ts](sdks/typescript/index.ts):
+
+```ts
+import { Agent } from "./index.ts";
+
+const agent = Agent.start("target/debug/seaotter-agent");
+const events = await agent.prompt("hello");
+await agent.continue();
+agent.close();
+```
+
+Python, in [sdks/python/agent.py](sdks/python/agent.py). The method is `continue_` because `continue` is a Python keyword. The JSON command is still `continue`.
+
+```python
+from agent import Agent
+
+agent = Agent.start("target/debug/seaotter-agent")
+events = agent.prompt("hello")
+agent.continue_()
+agent.close()
+```
+
+## Workflows
+
+`seaotter-agent --workflow` runs one of the example binaries. Those binaries need to be on `PATH`. The container image puts them there.
+
+```sh
+seaotter-agent --workflow examples/ticket-router
+seaotter-agent --workflow examples/gated-generate
+seaotter-agent --workflow examples/effects
+```
+
+[ticket-router](examples/ticket-router) routes a ticket from a typed choice. [gated-generate](examples/gated-generate) drafts only after a yes/no gate. [effects](examples/effects) runs `FileRead`, an allowlisted `HttpGet`, and a shell whose argv is fixed in Rust. That shell stays off until the example calls `Shell::grant` and the machine holds `DangerousShell`.
 
 ## Container
 
-`docker build -t seaotter-agent:dev .` produces an image that runs as `seaotter` (uid 10001), not root. `/data` is the writable path and is meant to be a host mount.
-
-No local effect needs root. `FileRead` and `HttpGet` run as that user. `DangerousShell` stays off unless Rust grants it. The command is fixed when the effect is built, and it runs without a shell.
-
-Edit a workflow, build the image, and run it offline. A bare run uses the fixtures baked into the image and does not call a model.
-
 ```sh
 docker build -t seaotter-agent:dev .
-docker run --rm seaotter-agent:dev --workflow examples/ticket-router
-docker run --rm seaotter-agent:dev --workflow examples/gated-generate
 ```
 
-A change to one example can reuse that image. Rebuild the binary with the Alpine musl toolchain and bind-mount it over `/usr/local/bin/ticket-router`:
+The image runs as `seaotter` (uid 10001). The entrypoint is `/usr/local/bin/seaotter`, which is a link to `seaotter-agent`. `/workspace` is the working directory and the volume. `/data` is the log path. The image has no API-key environment variable.
 
 ```sh
-docker run --rm -v "$(pwd)":/src -w /src -e CARGO_TARGET_DIR=/src/target/docker rust:1-alpine \
-  sh -c "apk add --no-cache musl-dev && cargo build --locked --release -p ticket-router"
-docker run --rm \
-  -v "$(pwd)/target/docker/release/ticket-router:/usr/local/bin/ticket-router" \
-  seaotter-agent:dev --workflow examples/ticket-router
+docker run --rm seaotter-agent:dev --health
+docker run --rm -v "$PWD:/workspace" seaotter-agent:dev
+docker run --rm seaotter-agent:dev --workflow examples/ticket-router
+docker run --rm seaotter-agent:dev --workflow examples/gated-generate
+docker run --rm -v "$(pwd)/data:/data" seaotter-agent:dev --workflow examples/effects
 ```
 
-`gated-generate` is the same shape with `-p gated-generate` and `target/docker/release/gated-generate`.
-
-Mount a host directory at `/data`. `/data/log` and `/data/workspace` stay on that directory for the next container. Keys arrive through `-e` or an env file: `OPENAI_API_KEY`, `OPENAI_MODEL`, `ANTHROPIC_API_KEY`, and `TYPESAFE_API_KEY`. `USER_ID` is recorded in `/data/log` and is not a credential.
+`--health` exits 0. A host directory mounted on `/workspace` is the session directory. Model workflows receive keys at `docker run`:
 
 ```sh
 docker run --rm -v "$(pwd)/data:/data" \
   -e OPENAI_API_KEY -e OPENAI_MODEL -e ANTHROPIC_API_KEY -e TYPESAFE_API_KEY -e USER_ID \
   seaotter-agent:dev --workflow examples/ticket-router
-docker run --rm -v "$(pwd)/data:/data" --env-file .env \
-  seaotter-agent:dev --workflow examples/gated-generate
 ```
 
-`gated-generate` drafts when `/data/approval` exists or `APPROVAL_TOKEN` is set, and a missing approval does not call the generative model.
-
-`examples/effects` runs `FileRead`, allowlisted `HttpGet`, and the shell inside the container. `FileRead` is rooted at `/data/workspace`. The shell stays off unless that binary grants it in Rust, and its argument vector is fixed there. No model is called. `HTTP_DESTINATIONS` narrows this example's hosts and is not a credential.
-
-```sh
-docker run --rm -v "$(pwd)/data:/data" seaotter-agent:dev --workflow examples/effects
-```
-
-The default bridge network gives the container its own stack, so `127.0.0.1` inside it is not the host. `--network host` uses the host network namespace. On Docker Desktop that host is the Linux VM, so a service bound only to the Mac's localhost is still unreachable. Neither mode widens the `HttpGet` allowlist or grants the shell.
+`gated-generate` drafts when `/data/approval` exists or `APPROVAL_TOKEN` is set. A rebuilt example binary can be bind-mounted over its path in `/usr/local/bin` so that one example can change without a full image rebuild.
 
 ## Consultant MCP
 
@@ -98,3 +162,23 @@ Cursor, in `.cursor/mcp.json`:
   }
 }
 ```
+
+## Development
+
+```sh
+cargo test --workspace
+```
+
+The SDK tests expect `target/debug/seaotter-agent` from `cargo build -p seaotter-agent`. `cargo test` does not run them.
+
+```sh
+node --test --experimental-strip-types sdks/typescript/index.test.ts
+```
+
+```sh
+cd sdks/python && python3 -m unittest test_agent.py
+```
+
+## License
+
+MIT OR Apache-2.0
