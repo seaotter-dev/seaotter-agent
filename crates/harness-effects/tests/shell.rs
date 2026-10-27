@@ -19,7 +19,7 @@ fn effect_error(result: Result<Value, HarnessError>) -> String {
 
 #[tokio::test]
 async fn runs_the_fixed_command_and_ignores_input() {
-    let shell = Shell::new("/bin/echo", ["hello"]).unwrap();
+    let shell = Shell::new("/bin/echo", ["hello"]).unwrap().grant();
     let expected = json!({"status": 0, "stdout": "hello\n", "stderr": ""});
     assert_eq!(shell.run(json!({})).await.unwrap(), expected);
     assert_eq!(
@@ -35,6 +35,7 @@ async fn runs_the_fixed_command_and_ignores_input() {
 async fn non_zero_exit_is_data_not_an_error() {
     let out = Shell::new("/usr/bin/false", Vec::<&str>::new())
         .unwrap()
+        .grant()
         .run(json!({}))
         .await
         .unwrap();
@@ -42,6 +43,7 @@ async fn non_zero_exit_is_data_not_an_error() {
 
     let out = Shell::new("/bin/ls", ["/definitely/not/here"])
         .unwrap()
+        .grant()
         .run(json!({}))
         .await
         .unwrap();
@@ -54,6 +56,7 @@ async fn environment_is_cleared_except_explicit_vars() {
     let out = Shell::new("/usr/bin/printenv", ["FOO"])
         .unwrap()
         .env("FOO", "bar")
+        .grant()
         .run(json!({}))
         .await
         .unwrap();
@@ -62,6 +65,7 @@ async fn environment_is_cleared_except_explicit_vars() {
     assert!(std::env::var_os("HOME").is_some(), "test needs HOME set");
     let out = Shell::new("/usr/bin/printenv", ["HOME"])
         .unwrap()
+        .grant()
         .run(json!({}))
         .await
         .unwrap();
@@ -76,6 +80,7 @@ async fn cwd_sets_the_working_directory() {
         .unwrap()
         .cwd(dir.path())
         .unwrap()
+        .grant()
         .run(json!({}))
         .await
         .unwrap();
@@ -109,6 +114,7 @@ async fn non_utf8_oversized_and_slow_commands_are_errors() {
     let msg = effect_error(
         Shell::new("/usr/bin/printf", ["\\377"])
             .unwrap()
+            .grant()
             .run(json!({}))
             .await,
     );
@@ -119,6 +125,7 @@ async fn non_utf8_oversized_and_slow_commands_are_errors() {
         Shell::new("/usr/bin/yes", Vec::<&str>::new())
             .unwrap()
             .max_bytes(16)
+            .grant()
             .run(json!({}))
             .await,
     );
@@ -130,6 +137,7 @@ async fn non_utf8_oversized_and_slow_commands_are_errors() {
         Shell::new("/bin/sleep", ["30"])
             .unwrap()
             .timeout(Duration::from_millis(200))
+            .grant()
             .run(json!({}))
             .await,
     );
@@ -139,6 +147,7 @@ async fn non_utf8_oversized_and_slow_commands_are_errors() {
     let msg = effect_error(
         Shell::new("/no/such/program", Vec::<&str>::new())
             .unwrap()
+            .grant()
             .run(json!({}))
             .await,
     );
@@ -170,6 +179,18 @@ fn touch(sentinel: &Path) -> Shell {
 }
 
 #[tokio::test]
+async fn an_ungranted_shell_does_not_spawn() {
+    let dir = TempDir::new().unwrap();
+    let sentinel = dir.path().join("ran");
+    let err = touch(&sentinel).run(json!({})).await.unwrap_err();
+    assert_eq!(
+        err,
+        HarnessError::CapabilityDenied(Capability::DangerousShell)
+    );
+    assert!(!sentinel.exists());
+}
+
+#[tokio::test]
 async fn default_machine_has_no_shell_effect() {
     let dir = TempDir::new().unwrap();
     let sentinel = dir.path().join("ran");
@@ -197,7 +218,7 @@ async fn machine_refuses_shell_without_the_capability() {
 #[tokio::test]
 async fn machine_runs_the_fixed_command_with_the_capability() {
     let machine = Machine::builder()
-        .effect(Shell::new("/bin/echo", ["fixed"]).unwrap())
+        .effect(Shell::new("/bin/echo", ["fixed"]).unwrap().grant())
         .grant(Capability::DangerousShell)
         .build();
     let run = machine.run(&workflow(), hostile_state()).await.unwrap();
@@ -208,7 +229,7 @@ async fn machine_runs_the_fixed_command_with_the_capability() {
     let dir = TempDir::new().unwrap();
     let sentinel = dir.path().join("ran");
     let machine = Machine::builder()
-        .effect(touch(&sentinel))
+        .effect(touch(&sentinel).grant())
         .grant(Capability::DangerousShell)
         .build();
     machine.run(&workflow(), hostile_state()).await.unwrap();
