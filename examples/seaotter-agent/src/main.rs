@@ -42,6 +42,14 @@ fn main() -> ExitCode {
             }
             return ExitCode::SUCCESS;
         }
+        Ok(Request::Print(message)) => {
+            print!("{}", print_reply(message));
+            return ExitCode::SUCCESS;
+        }
+        Ok(Request::Json(message)) => {
+            print!("{}", json_events(message));
+            return ExitCode::SUCCESS;
+        }
         Ok(Request::Workflow(workflow, bin, rest)) => (workflow, bin, rest),
         Err(err) => {
             eprintln!("{err}");
@@ -69,6 +77,8 @@ enum Request<'a> {
     Health,
     Session,
     Continue,
+    Print(&'a str),
+    Json(&'a str),
     Workflow(&'a str, &'static str, &'a [String]),
 }
 
@@ -82,8 +92,55 @@ fn parse(args: &[String]) -> Result<Request<'_>, String> {
     if args.len() == 1 && args[0] == "--continue" {
         return Ok(Request::Continue);
     }
+    if let Some(request) = parse_output(args)? {
+        return Ok(request);
+    }
     let (workflow, bin, rest) = parse_workflow(args)?;
     Ok(Request::Workflow(workflow, bin, rest))
+}
+
+fn parse_output(args: &[String]) -> Result<Option<Request<'_>>, String> {
+    match args.first().map(String::as_str) {
+        Some("--print") => {
+            if args.len() == 1 {
+                return Err("--print needs a message".into());
+            }
+            if args.len() != 2 {
+                return Err("--print takes one message".into());
+            }
+            Ok(Some(Request::Print(&args[1])))
+        }
+        Some("--mode") => {
+            let mode = args.get(1).ok_or("--mode needs json")?;
+            if mode != "json" {
+                return Err(format!("unknown mode `{mode}`"));
+            }
+            if args.len() == 2 {
+                return Err("--mode json needs a message".into());
+            }
+            if args.len() != 3 {
+                return Err("--mode json takes one message".into());
+            }
+            Ok(Some(Request::Json(&args[2])))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn print_reply(message: &str) -> String {
+    format!("{message}\n")
+}
+
+fn json_events(message: &str) -> String {
+    let decision = serde_json::json!({"kind": "decision", "action": "read"});
+    let effect = serde_json::json!({"kind": "effect", "name": "read"});
+    let reply = serde_json::json!({"kind": "reply", "text": message});
+    format!(
+        "{}\n{}\n{}\n",
+        serde_json::to_string(&decision).expect("decision"),
+        serde_json::to_string(&effect).expect("effect"),
+        serde_json::to_string(&reply).expect("reply"),
+    )
 }
 
 fn system_prompt(dir: &Path) -> String {
@@ -308,8 +365,8 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 #[cfg(test)]
 mod tests {
     use super::{
-        Entry, Request, active_branch, continue_session, ensure_workspace, parse, session,
-        start_session, system_prompt,
+        Entry, Request, active_branch, continue_session, ensure_workspace, json_events, parse,
+        print_reply, session, start_session, system_prompt,
     };
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -593,6 +650,57 @@ mod tests {
         assert_eq!(workflow, "examples/effects");
         assert_eq!(bin, "effects");
         assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn print_writes_the_message_and_needs_one() {
+        let printed = args(&["--print", "hello"]);
+        let Request::Print(message) = parse(&printed).unwrap() else {
+            panic!("expected print");
+        };
+        assert_eq!(message, "hello");
+        assert_eq!(print_reply(message), "hello\n");
+        let err = parse(&args(&["--print"])).unwrap_err();
+        assert!(err.contains("message"), "{err}");
+        let err = parse(&args(&["--print", "hello", "extra"])).unwrap_err();
+        assert!(err.contains("message"), "{err}");
+    }
+
+    #[test]
+    fn json_mode_writes_three_events() {
+        let json = args(&["--mode", "json", "hello"]);
+        let Request::Json(message) = parse(&json).unwrap() else {
+            panic!("expected json");
+        };
+        assert_eq!(message, "hello");
+        let stream = json_events(message);
+        let lines: Vec<_> = stream.lines().collect();
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        let decision: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        let effect: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        let reply: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(decision["kind"], "decision");
+        assert_eq!(decision["action"], "read");
+        assert_eq!(effect["kind"], "effect");
+        assert_eq!(effect["name"], "read");
+        assert!(effect.get("output").is_none());
+        assert_eq!(reply["kind"], "reply");
+        assert_eq!(reply["text"], "hello");
+        let err = parse(&args(&["--mode"])).unwrap_err();
+        assert!(err.contains("json"), "{err}");
+        let err = parse(&args(&["--mode", "rpc"])).unwrap_err();
+        assert!(err.contains("rpc"), "{err}");
+    }
+
+    #[test]
+    fn print_and_json_do_not_write_a_session() {
+        let dir = std::env::temp_dir().join(format!("seaotter-print-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(print_reply("hello"), "hello\n");
+        assert!(json_events("hello").contains("\"kind\":\"reply\""));
+        assert!(!dir.join(".seaotter").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
