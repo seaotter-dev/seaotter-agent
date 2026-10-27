@@ -5,9 +5,10 @@ use std::time::SystemTime;
 
 use harness_core::{
     Action, Answer, BoxFuture, DecisionModel, DecisionRequest, DecisionResponse, Effect, GenOutput,
-    GenRequest, GenResponse, GenerativeModel, HarnessError, Usage, choose,
+    GenRequest, GenResponse, GenerativeModel, HarnessError, JsonSchema, OutputSpec, Usage, choose,
+    validate_output,
 };
-use harness_effects::{FileRead, Search};
+use harness_effects::{FileRead, Search, Shell};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -296,15 +297,18 @@ fn start_session(dir: &Path) -> Result<String, String> {
 
 fn read_prompt(
     dir: &Path,
-    input: impl std::io::BufRead,
+    mut input: impl std::io::BufRead,
     output: &mut impl std::io::Write,
     model: &dyn DecisionModel,
     writer: &dyn GenerativeModel,
 ) -> Result<(), String> {
+    mark_interrupted(dir, output)?;
     let text = start_session(dir)?;
     write_prompt(output, &text)?;
-    for line in input.lines() {
-        let line = line.map_err(|err| err.to_string())?;
+    loop {
+        let Some(line) = read_one(&mut input)? else {
+            return Ok(());
+        };
         if line.is_empty() {
             write_prompt(output, "> \n")?;
             continue;
@@ -314,12 +318,69 @@ fn read_prompt(
         }
         append_line(dir, &line)?;
         write_prompt(output, &format!("{line}\n"))?;
-        if let Err(err) = run_turn(dir, &line, model, writer, output) {
+        if let Err(err) = run_turn(dir, &line, &mut input, model, writer, output) {
             eprintln!("{err}");
         }
         write_prompt(output, "> \n")?;
     }
-    Ok(())
+}
+
+fn read_one(input: &mut impl std::io::BufRead) -> Result<Option<String>, String> {
+    let mut buf = String::new();
+    let n = input.read_line(&mut buf).map_err(|err| err.to_string())?;
+    if n == 0 {
+        return Ok(None);
+    }
+    if buf.ends_with('\n') {
+        buf.pop();
+        if buf.ends_with('\r') {
+            buf.pop();
+        }
+    }
+    Ok(Some(buf))
+}
+
+fn mark_interrupted(dir: &Path, output: &mut impl std::io::Write) -> Result<(), String> {
+    let path = match newest_session(dir) {
+        Ok(path) => path,
+        Err(err) if err == "no session" => return Ok(()),
+        Err(err) => return Err(err),
+    };
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|err| format!("reading {}: {err}", path.display()))?;
+    let entries = parse_entries(&path, &raw)?;
+    let Some(last) = entries.last() else {
+        return Ok(());
+    };
+    if !last.text.starts_with("shell ") {
+        return Ok(());
+    }
+    append_line(dir, "interrupted")?;
+    write_prompt(output, "interrupted\n")
+}
+
+struct WatchedDecision<'a> {
+    inner: &'a dyn DecisionModel,
+    low_shell: &'a Mutex<bool>,
+}
+
+impl DecisionModel for WatchedDecision<'_> {
+    fn evaluate(
+        &self,
+        req: DecisionRequest,
+    ) -> BoxFuture<'_, Result<DecisionResponse, HarnessError>> {
+        let low_shell = self.low_shell;
+        let fut = self.inner.evaluate(req);
+        Box::pin(async move {
+            let resp = fut.await?;
+            if let Some(answer) = resp.answers.get("action") {
+                if answer.top() == Some("shell") && answer.confidence < 0.7 {
+                    *low_shell.lock().expect("low shell") = true;
+                }
+            }
+            Ok(resp)
+        })
+    }
 }
 
 struct OfflineTurn {
@@ -395,14 +456,20 @@ impl GenerativeModel for OfflineTurn {
 fn run_turn(
     dir: &Path,
     line: &str,
+    input: &mut impl std::io::BufRead,
     model: &dyn DecisionModel,
     writer: &dyn GenerativeModel,
     output: &mut impl std::io::Write,
 ) -> Result<(), String> {
     let system = system_prompt(dir);
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+    let low_shell = Mutex::new(false);
+    let watched = WatchedDecision {
+        inner: model,
+        low_shell: &low_shell,
+    };
     let steps = runtime
-        .block_on(choose(model, writer, line, &system))
+        .block_on(choose(&watched, writer, line, &system))
         .map_err(|err| err.to_string())?;
     for step in steps {
         match step.action {
@@ -464,10 +531,102 @@ fn run_turn(
                 write_edit(dir, path, patch)?;
                 write_prompt(output, &format!("{path}\n"))?;
             }
-            Action::Stop | Action::Shell => {}
+            Action::Stop => {}
+            Action::Shell => {
+                confirm_shell(dir, line, &system, &runtime, input, writer, output)?;
+            }
         }
     }
+    if *low_shell.lock().expect("low shell") {
+        write_prompt(output, "skip\n")?;
+    }
     Ok(())
+}
+
+fn confirm_shell(
+    dir: &Path,
+    line: &str,
+    system: &str,
+    runtime: &tokio::runtime::Runtime,
+    input: &mut impl std::io::BufRead,
+    writer: &dyn GenerativeModel,
+    output: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let spec = OutputSpec::Schema(JsonSchema(json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["argv"],
+        "properties": {
+            "argv": {
+                "type": "array",
+                "items": { "type": "string" },
+                "minItems": 1
+            }
+        }
+    })));
+    let req = GenRequest {
+        task: "Return an argv.".into(),
+        context: json!({
+            "message": line,
+            "system": system,
+        }),
+        output: spec.clone(),
+        max_tokens: 1024,
+    };
+    let resp = runtime
+        .block_on(writer.complete(req))
+        .map_err(|err| err.to_string())?;
+    validate_output(&spec, &resp.output).map_err(|err| err.to_string())?;
+    let GenOutput::Json(value) = resp.output else {
+        return Err("shell has no argv".into());
+    };
+    let argv = value
+        .get("argv")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "shell has no argv".to_string())?;
+    let args = argv
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "shell has no argv".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(program) = args.first() else {
+        return Err("shell has no argv".into());
+    };
+    if !Path::new(program).is_absolute() {
+        return Err(format!(
+            "shell: program `{program}` is not an absolute path"
+        ));
+    }
+    let shown = args.join(" ");
+    write_prompt(output, &format!("{shown}\n"))?;
+    append_line(dir, &format!("shell {shown}"))?;
+    write_prompt(output, "yes? ")?;
+    let answer = read_one(input)?;
+    if answer.as_deref() != Some("yes") {
+        write_prompt(output, "skipped\n")?;
+        append_line(dir, "skipped")?;
+        return Ok(());
+    }
+    let effect = Shell::new(program, &args[1..])
+        .map_err(|err| err.to_string())?
+        .cwd(dir)
+        .map_err(|err| err.to_string())?
+        .grant();
+    let value = runtime
+        .block_on(effect.run(json!({})))
+        .map_err(|err| err.to_string())?;
+    let stdout = value.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let stored = if stdout.is_empty() {
+        let code = value.get("status").and_then(Value::as_i64).unwrap_or(0);
+        format!("status {code}")
+    } else {
+        stdout.trim_end_matches('\n').to_string()
+    };
+    write_prompt(output, &format!("{stored}\n"))?;
+    append_line(dir, &stored)
 }
 
 fn is_contained(path: &Path) -> bool {
@@ -781,19 +940,26 @@ mod tests {
 
     struct ScriptedWriter {
         outputs: Mutex<VecDeque<GenOutput>>,
+        calls: Mutex<usize>,
     }
 
     impl ScriptedWriter {
         fn new(outputs: Vec<GenOutput>) -> Self {
             Self {
                 outputs: Mutex::new(outputs.into()),
+                calls: Mutex::new(0),
             }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
         }
     }
 
     impl GenerativeModel for ScriptedWriter {
         fn complete(&self, req: GenRequest) -> BoxFuture<'_, Result<GenResponse, HarnessError>> {
             let _ = req;
+            *self.calls.lock().unwrap() += 1;
             let output = self.outputs.lock().unwrap().pop_front().unwrap();
             Box::pin(async move {
                 Ok(GenResponse {
@@ -1113,22 +1279,163 @@ mod tests {
         let _ = std::fs::remove_file(outside);
     }
 
+    fn echo_argv() -> GenOutput {
+        GenOutput::Json(json!({"argv": ["/bin/echo", "hello"]}))
+    }
+
     #[test]
-    fn shell_then_stop_adds_no_result_line() {
-        let dir = temp_dir("shell");
+    fn yes_spawns_the_shell_and_stores_its_result() {
+        let dir = temp_dir("shell-yes");
         let model = ScriptedDecision::new(&[("shell", 0.9), ("stop", 0.9)]);
-        let writer = ScriptedWriter::new(vec![]);
+        let writer = ScriptedWriter::new(vec![echo_argv()]);
         let mut output = Vec::new();
         read_prompt(
             &dir,
-            std::io::Cursor::new("hello\n/quit\n"),
+            std::io::Cursor::new("go\nyes\n/quit\n"),
             &mut output,
             &model,
             &writer,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
-        assert_eq!(text, format!("{}hello\n> \n", session(&dir)));
+        assert!(text.contains("/bin/echo hello"), "{text}");
+        assert!(text.contains("hello\n"), "{text}");
+        assert_eq!(writer.calls(), 1);
+        let entries = prompt_entries(&dir);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.text == "shell /bin/echo hello\n")
+        );
+        assert!(entries.iter().any(|entry| entry.text == "hello\n"));
+        let shell = entries
+            .iter()
+            .position(|entry| entry.text == "shell /bin/echo hello\n")
+            .unwrap();
+        assert_eq!(entries[shell + 1].text, "hello\n");
+        assert!(entries.iter().all(|entry| entry.text != "yes\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_skips_the_shell_without_spawning() {
+        let dir = temp_dir("shell-no");
+        let model = ScriptedDecision::new(&[("shell", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![echo_argv()]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("go\nno\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("skipped"), "{text}");
+        assert!(!text.contains("\nhello\n"), "{text}");
+        let entries = prompt_entries(&dir);
+        let shell = entries
+            .iter()
+            .position(|entry| entry.text == "shell /bin/echo hello\n")
+            .unwrap();
+        assert_eq!(entries[shell + 1].text, "skipped\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_low_confidence_shell_prints_skip() {
+        let dir = temp_dir("shell-low");
+        let model = ScriptedDecision::new(&[("shell", 0.2)]);
+        let writer = ScriptedWriter::new(vec![]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("go\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("skip\n"), "{text}");
+        assert_eq!(writer.calls(), 0);
+        let entries = prompt_entries(&dir);
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.text.starts_with("shell "))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shell_without_a_result_is_interrupted_on_the_next_open() {
+        let dir = temp_dir("shell-crash");
+        let marker = dir.join("marker");
+        let sessions = dir.join(".seaotter/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let crashed = sessions.join("crashed.jsonl");
+        let shell = format!("shell /usr/bin/touch {}\n", marker.display());
+        let lines = [
+            Entry {
+                id: "1".into(),
+                parent: None,
+                text: "session\n".into(),
+            },
+            Entry {
+                id: "2".into(),
+                parent: Some("1".into()),
+                text: shell,
+            },
+        ];
+        let raw = lines
+            .iter()
+            .map(|entry| serde_json::to_string(entry).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&crashed, &raw).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&crashed)
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1))
+            .unwrap();
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("interrupted\n"), "{text}");
+        assert!(!marker.exists());
+        let saved = std::fs::read_to_string(&crashed).unwrap();
+        let entries: Vec<Entry> = saved
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(entries.last().unwrap().text, "interrupted\n");
+        assert_eq!(entries.last().unwrap().parent.as_deref(), Some("2"));
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let again = std::fs::read_to_string(&crashed).unwrap();
+        assert_eq!(again, saved);
+        assert!(!marker.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
