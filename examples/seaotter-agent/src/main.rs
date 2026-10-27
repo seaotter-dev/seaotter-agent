@@ -51,12 +51,12 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Ok(Request::Rpc) => {
-            let mut input = String::new();
-            if let Err(err) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
+            let stdin = std::io::stdin();
+            let mut stdout = std::io::stdout().lock();
+            if let Err(err) = serve_rpc_stream(stdin.lock(), &mut stdout) {
                 eprintln!("{err}");
                 return ExitCode::FAILURE;
             }
-            print!("{}", serve_rpc(&input));
             return ExitCode::SUCCESS;
         }
         Ok(Request::Workflow(workflow, bin, rest)) => (workflow, bin, rest),
@@ -166,22 +166,37 @@ enum RpcStep {
     Stop(String),
 }
 
+#[cfg(test)]
 fn serve_rpc(input: &str) -> String {
-    let mut out = String::new();
-    let mut remembered: Option<String> = None;
+    let mut out = Vec::new();
+    serve_rpc_stream(std::io::Cursor::new(input), &mut out).expect("rpc");
+    String::from_utf8(out).expect("rpc")
+}
+
+fn serve_rpc_stream(
+    input: impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let mut remembered = None;
     for line in input.lines() {
+        let line = line.map_err(|err| err.to_string())?;
         if line.is_empty() {
             continue;
         }
-        match command_output(line, &mut remembered) {
-            RpcStep::Continue(text) => out.push_str(&text),
-            RpcStep::Stop(text) => {
-                out.push_str(&text);
-                break;
-            }
+        let step = command_output(&line, &mut remembered);
+        let stop = matches!(step, RpcStep::Stop(_));
+        let text = match step {
+            RpcStep::Continue(text) | RpcStep::Stop(text) => text,
+        };
+        output
+            .write_all(text.as_bytes())
+            .map_err(|err| err.to_string())?;
+        output.flush().map_err(|err| err.to_string())?;
+        if stop {
+            break;
         }
     }
-    out
+    Ok(())
 }
 
 fn command_output(line: &str, remembered: &mut Option<String>) -> RpcStep {
