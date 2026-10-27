@@ -56,8 +56,19 @@ fn parse(args: &[String]) -> Result<Request<'_>, String> {
     Ok(Request::Workflow(workflow, bin, rest))
 }
 
+fn system_prompt(dir: &Path) -> String {
+    std::fs::read_to_string(dir.join("AGENTS.md")).unwrap_or_default()
+}
+
 fn session(dir: &Path) -> String {
-    format!("{}\n> \n", dir.display())
+    let prompt = system_prompt(dir);
+    if prompt.is_empty() {
+        format!("{}\n> \n", dir.display())
+    } else if prompt.ends_with('\n') {
+        format!("{}\n{prompt}> \n", dir.display())
+    } else {
+        format!("{}\n{prompt}\n> \n", dir.display())
+    }
 }
 
 fn ensure_workspace(root: &Path) -> Result<(), String> {
@@ -82,7 +93,7 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, ensure_workspace, parse, session};
+    use super::{Request, ensure_workspace, parse, session, system_prompt};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(str::to_string).collect()
@@ -127,6 +138,34 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("seaotter-session-{}", std::process::id()));
         let text = session(&dir);
         assert_eq!(text, format!("{}\n> \n", dir.display()));
+    }
+
+    #[test]
+    fn agents_md_is_the_system_prompt() {
+        let dir = std::env::temp_dir().join(format!("seaotter-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "use rust\n").unwrap();
+        std::fs::write(dir.join("SKILL.md"), "skill secret\n").unwrap();
+        assert_eq!(system_prompt(&dir), "use rust\n");
+        let text = session(&dir);
+        assert_eq!(text, format!("{}\nuse rust\n> \n", dir.display()));
+        assert!(!text.contains("skill secret"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_parent_agents_file_is_not_read() {
+        let parent =
+            std::env::temp_dir().join(format!("seaotter-agents-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&parent);
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(parent.join("AGENTS.md"), "parent instructions\n").unwrap();
+        let text = session(&child);
+        assert_eq!(text, format!("{}\n> \n", child.display()));
+        assert!(!text.contains("parent instructions"), "{text}");
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]
