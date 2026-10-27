@@ -16,12 +16,11 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            match start_session(&dir) {
-                Ok(text) => print!("{text}"),
-                Err(err) => {
-                    eprintln!("{err}");
-                    return ExitCode::FAILURE;
-                }
+            let stdin = std::io::stdin();
+            let mut stdout = std::io::stdout().lock();
+            if let Err(err) = read_prompt(&dir, stdin.lock(), &mut stdout) {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
             }
             return ExitCode::SUCCESS;
         }
@@ -287,6 +286,52 @@ fn start_session(dir: &Path) -> Result<String, String> {
     Ok(text)
 }
 
+fn read_prompt(
+    dir: &Path,
+    input: impl std::io::BufRead,
+    output: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let text = start_session(dir)?;
+    write_prompt(output, &text)?;
+    for line in input.lines() {
+        let line = line.map_err(|err| err.to_string())?;
+        if line.is_empty() {
+            write_prompt(output, "> \n")?;
+            continue;
+        }
+        if line == "/quit" {
+            return Ok(());
+        }
+        append_line(dir, &line)?;
+        write_prompt(output, &format!("{line}\n> \n"))?;
+    }
+    Ok(())
+}
+
+fn write_prompt(output: &mut impl std::io::Write, text: &str) -> Result<(), String> {
+    output
+        .write_all(text.as_bytes())
+        .map_err(|err| err.to_string())?;
+    output.flush().map_err(|err| err.to_string())
+}
+
+fn append_line(dir: &Path, line: &str) -> Result<(), String> {
+    let path = newest_session(dir)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|err| format!("reading {}: {err}", path.display()))?;
+    let entries = parse_entries(&path, &raw)?;
+    let parent = entries
+        .last()
+        .map(|entry| entry.id.clone())
+        .ok_or_else(|| "no session".to_string())?;
+    let entry = Entry {
+        id: next_numeric_id(&entries).to_string(),
+        parent: Some(parent),
+        text: format!("{line}\n"),
+    };
+    append_entries(&path, &raw, &[entry])
+}
+
 fn continue_session(dir: &Path) -> Result<String, String> {
     let path = newest_session(dir)?;
     let raw = std::fs::read_to_string(&path)
@@ -467,7 +512,7 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 mod tests {
     use super::{
         Entry, Request, active_branch, continue_session, ensure_workspace, json_events, parse,
-        print_reply, serve_rpc, session, start_session, system_prompt,
+        print_reply, read_prompt, serve_rpc, session, start_session, system_prompt,
     };
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -564,6 +609,60 @@ mod tests {
         let entry: Entry = serde_json::from_str(lines[0]).unwrap();
         assert_eq!(entry.parent, None);
         assert_eq!(entry.text, text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn prompt_entries(dir: &std::path::Path) -> Vec<Entry> {
+        let mut files = std::fs::read_dir(dir.join(".seaotter/sessions"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(files.len(), 1);
+        let raw = std::fs::read_to_string(files.pop().unwrap()).unwrap();
+        raw.lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_line_is_echoed_and_an_empty_line_is_not_stored() {
+        let dir = std::env::temp_dir().join(format!("seaotter-prompt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("\nhello\n\n/quit\n"),
+            &mut output,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text, format!("{}> \nhello\n> \n> \n", session(&dir)));
+        let entries = prompt_entries(&dir);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "1");
+        assert_eq!(entries[0].parent, None);
+        assert_eq!(entries[1].id, "2");
+        assert_eq!(entries[1].parent.as_deref(), Some("1"));
+        assert_eq!(entries[1].text, "hello\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn end_of_input_stores_the_line() {
+        let dir = std::env::temp_dir().join(format!("seaotter-prompt-eof-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut output = Vec::new();
+        read_prompt(&dir, std::io::Cursor::new("hello\n"), &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text, format!("{}hello\n> \n", session(&dir)));
+        let entries = prompt_entries(&dir);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].id, "2");
+        assert_eq!(entries[1].parent.as_deref(), Some("1"));
+        assert_eq!(entries[1].text, "hello\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
