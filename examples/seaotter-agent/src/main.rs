@@ -1,8 +1,15 @@
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
+use std::sync::Mutex;
 use std::time::SystemTime;
 
+use harness_core::{
+    Action, Answer, BoxFuture, DecisionModel, DecisionRequest, DecisionResponse, Effect, GenOutput,
+    GenRequest, GenResponse, GenerativeModel, HarnessError, Usage, choose,
+};
+use harness_effects::{FileRead, Search};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -18,7 +25,8 @@ fn main() -> ExitCode {
             };
             let stdin = std::io::stdin();
             let mut stdout = std::io::stdout().lock();
-            if let Err(err) = read_prompt(&dir, stdin.lock(), &mut stdout) {
+            let turn = OfflineTurn::new(dir.clone());
+            if let Err(err) = read_prompt(&dir, stdin.lock(), &mut stdout, &turn, &turn) {
                 eprintln!("{err}");
                 return ExitCode::FAILURE;
             }
@@ -290,6 +298,8 @@ fn read_prompt(
     dir: &Path,
     input: impl std::io::BufRead,
     output: &mut impl std::io::Write,
+    model: &dyn DecisionModel,
+    writer: &dyn GenerativeModel,
 ) -> Result<(), String> {
     let text = start_session(dir)?;
     write_prompt(output, &text)?;
@@ -303,7 +313,214 @@ fn read_prompt(
             return Ok(());
         }
         append_line(dir, &line)?;
-        write_prompt(output, &format!("{line}\n> \n"))?;
+        write_prompt(output, &format!("{line}\n"))?;
+        if let Err(err) = run_turn(dir, &line, model, writer, output) {
+            eprintln!("{err}");
+        }
+        write_prompt(output, "> \n")?;
+    }
+    Ok(())
+}
+
+struct OfflineTurn {
+    dir: PathBuf,
+    calls: Mutex<usize>,
+}
+
+impl OfflineTurn {
+    fn new(dir: PathBuf) -> Self {
+        Self {
+            dir,
+            calls: Mutex::new(0),
+        }
+    }
+}
+
+impl DecisionModel for OfflineTurn {
+    fn evaluate(
+        &self,
+        req: DecisionRequest,
+    ) -> BoxFuture<'_, Result<DecisionResponse, HarnessError>> {
+        let message = req
+            .state
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let mut calls = self.calls.lock().expect("offline turn");
+        let label = if *calls == 0 && contained_file(&self.dir, &message) {
+            "read"
+        } else if *calls == 0 {
+            "search"
+        } else {
+            "stop"
+        };
+        *calls += 1;
+        drop(calls);
+        let label = label.to_string();
+        Box::pin(async move {
+            let mut answers = std::collections::BTreeMap::new();
+            answers.insert(
+                "action".into(),
+                Answer {
+                    probabilities: std::collections::BTreeMap::from([(label, 0.9)]),
+                    confidence: 0.9,
+                },
+            );
+            Ok(DecisionResponse {
+                answers,
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+
+impl GenerativeModel for OfflineTurn {
+    fn complete(&self, req: GenRequest) -> BoxFuture<'_, Result<GenResponse, HarnessError>> {
+        let line = req
+            .context
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        Box::pin(async move {
+            Ok(GenResponse {
+                output: GenOutput::Text(line),
+                usage: Usage::default(),
+            })
+        })
+    }
+}
+
+fn run_turn(
+    dir: &Path,
+    line: &str,
+    model: &dyn DecisionModel,
+    writer: &dyn GenerativeModel,
+    output: &mut impl std::io::Write,
+) -> Result<(), String> {
+    let system = system_prompt(dir);
+    let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+    let steps = runtime
+        .block_on(choose(model, writer, line, &system))
+        .map_err(|err| err.to_string())?;
+    for step in steps {
+        match step.action {
+            Action::Read => {
+                let effect = FileRead::new(dir).map_err(|err| err.to_string())?;
+                let value = runtime
+                    .block_on(effect.run(json!({"path": line})))
+                    .map_err(|err| err.to_string())?;
+                let path = value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "read has no path".to_string())?;
+                let bytes = value
+                    .get("bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| "read has no bytes".to_string())?;
+                write_prompt(output, &format!("{path} {bytes}\n"))?;
+            }
+            Action::Search => {
+                let effect = Search::new(dir).map_err(|err| err.to_string())?;
+                let value = runtime
+                    .block_on(effect.run(json!({"query": line})))
+                    .map_err(|err| err.to_string())?;
+                let paths = value
+                    .get("paths")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| "search has no paths".to_string())?;
+                let found = paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                write_prompt(output, &format!("{found}\n"))?;
+            }
+            Action::Reply => {
+                let text = match step.write {
+                    Some(GenOutput::Text(text)) => text,
+                    _ => return Err("reply has no text".into()),
+                };
+                if text.ends_with('\n') {
+                    write_prompt(output, &text)?;
+                } else {
+                    write_prompt(output, &format!("{text}\n"))?;
+                }
+            }
+            Action::Edit => {
+                let value = match step.write {
+                    Some(GenOutput::Json(value)) => value,
+                    _ => return Err("edit has no patch".into()),
+                };
+                let path = value
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "edit has no path".to_string())?;
+                let patch = value
+                    .get("patch")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "edit has no patch".to_string())?;
+                write_edit(dir, path, patch)?;
+                write_prompt(output, &format!("{path}\n"))?;
+            }
+            Action::Stop | Action::Shell => {}
+        }
+    }
+    Ok(())
+}
+
+fn is_contained(path: &Path) -> bool {
+    let mut any = false;
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => any = true,
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+        }
+    }
+    any
+}
+
+fn contained_file(dir: &Path, line: &str) -> bool {
+    let path = Path::new(line);
+    is_contained(path) && dir.join(path).is_file()
+}
+
+fn write_edit(dir: &Path, rel: &str, patch: &str) -> Result<(), String> {
+    let path = Path::new(rel);
+    if !is_contained(path) {
+        return Err(format!("path `{rel}` escapes the directory"));
+    }
+    let root = std::fs::canonicalize(dir).map_err(|err| err.to_string())?;
+    let full = dir.join(path);
+    if std::fs::symlink_metadata(&full)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(format!("path `{rel}` escapes the directory"));
+    }
+    let parent = full.parent().unwrap_or(dir);
+    let mut existing = parent;
+    while !existing.exists() {
+        existing = existing.parent().unwrap_or(dir);
+    }
+    let canonical_existing = std::fs::canonicalize(existing).map_err(|err| err.to_string())?;
+    if !canonical_existing.starts_with(&root) {
+        return Err(format!("path `{rel}` escapes the directory"));
+    }
+    if parent != existing {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("creating {}: {err}", parent.display()))?;
+        let canonical_parent = std::fs::canonicalize(parent).map_err(|err| err.to_string())?;
+        if !canonical_parent.starts_with(&root) {
+            return Err(format!("path `{rel}` escapes the directory"));
+        }
+    }
+    std::fs::write(&full, patch).map_err(|err| format!("writing {}: {err}", full.display()))?;
+    let canonical_file = std::fs::canonicalize(&full).map_err(|err| err.to_string())?;
+    if !canonical_file.starts_with(&root) {
+        return Err(format!("path `{rel}` escapes the directory"));
     }
     Ok(())
 }
@@ -510,10 +727,103 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::Mutex;
+
+    use harness_core::{
+        Answer, BoxFuture, DecisionModel, DecisionRequest, DecisionResponse, GenOutput, GenRequest,
+        GenResponse, GenerativeModel, HarnessError, Usage,
+    };
+    use serde_json::json;
+
     use super::{
         Entry, Request, active_branch, continue_session, ensure_workspace, json_events, parse,
         print_reply, read_prompt, serve_rpc, session, start_session, system_prompt,
     };
+
+    struct ScriptedDecision {
+        steps: Mutex<VecDeque<(&'static str, f64)>>,
+        seen: Mutex<Vec<DecisionRequest>>,
+    }
+
+    impl ScriptedDecision {
+        fn new(steps: &[(&'static str, f64)]) -> Self {
+            Self {
+                steps: Mutex::new(steps.iter().copied().collect()),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DecisionModel for ScriptedDecision {
+        fn evaluate(
+            &self,
+            req: DecisionRequest,
+        ) -> BoxFuture<'_, Result<DecisionResponse, HarnessError>> {
+            let (top, confidence) = self.steps.lock().unwrap().pop_front().unwrap();
+            self.seen.lock().unwrap().push(req);
+            Box::pin(async move {
+                let mut answers = BTreeMap::new();
+                answers.insert(
+                    "action".into(),
+                    Answer {
+                        probabilities: BTreeMap::from([(top.to_owned(), confidence)]),
+                        confidence,
+                    },
+                );
+                Ok(DecisionResponse {
+                    answers,
+                    usage: Usage::default(),
+                })
+            })
+        }
+    }
+
+    struct ScriptedWriter {
+        outputs: Mutex<VecDeque<GenOutput>>,
+    }
+
+    impl ScriptedWriter {
+        fn new(outputs: Vec<GenOutput>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into()),
+            }
+        }
+    }
+
+    impl GenerativeModel for ScriptedWriter {
+        fn complete(&self, req: GenRequest) -> BoxFuture<'_, Result<GenResponse, HarnessError>> {
+            let _ = req;
+            let output = self.outputs.lock().unwrap().pop_front().unwrap();
+            Box::pin(async move {
+                Ok(GenResponse {
+                    output,
+                    usage: Usage::default(),
+                })
+            })
+        }
+    }
+
+    fn stop_model() -> (ScriptedDecision, ScriptedWriter) {
+        (
+            ScriptedDecision::new(&[("stop", 0.9)]),
+            ScriptedWriter::new(vec![]),
+        )
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "seaotter-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(str::to_string).collect()
@@ -627,14 +937,15 @@ mod tests {
 
     #[test]
     fn a_line_is_echoed_and_an_empty_line_is_not_stored() {
-        let dir = std::env::temp_dir().join(format!("seaotter-prompt-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("prompt");
         let mut output = Vec::new();
+        let (model, writer) = stop_model();
         read_prompt(
             &dir,
             std::io::Cursor::new("\nhello\n\n/quit\n"),
             &mut output,
+            &model,
+            &writer,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -651,11 +962,17 @@ mod tests {
 
     #[test]
     fn end_of_input_stores_the_line() {
-        let dir = std::env::temp_dir().join(format!("seaotter-prompt-eof-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = temp_dir("prompt-eof");
         let mut output = Vec::new();
-        read_prompt(&dir, std::io::Cursor::new("hello\n"), &mut output).unwrap();
+        let (model, writer) = stop_model();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("hello\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
         let text = String::from_utf8(output).unwrap();
         assert_eq!(text, format!("{}hello\n> \n", session(&dir)));
         let entries = prompt_entries(&dir);
@@ -663,6 +980,155 @@ mod tests {
         assert_eq!(entries[1].id, "2");
         assert_eq!(entries[1].parent.as_deref(), Some("1"));
         assert_eq!(entries[1].text, "hello\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_calls_choose_and_reads_one_line() {
+        let dir = temp_dir("read");
+        std::fs::write(dir.join("AGENTS.md"), "be brief\n").unwrap();
+        std::fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+        let model = ScriptedDecision::new(&[("read", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("notes.txt\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("notes.txt 6\n"), "{text}");
+        assert!(text.ends_with("> \n"), "{text}");
+        let seen = model.seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        for req in seen.iter() {
+            assert_eq!(
+                req.state.get("message").and_then(|value| value.as_str()),
+                Some("notes.txt")
+            );
+            assert_eq!(
+                req.state.get("system").and_then(|value| value.as_str()),
+                Some("be brief\n")
+            );
+        }
+        let entries = prompt_entries(&dir);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].text, "notes.txt\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_prints_one_result_line() {
+        let dir = temp_dir("search");
+        std::fs::write(dir.join("notes.txt"), "needle\n").unwrap();
+        let model = ScriptedDecision::new(&[("search", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("needle\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        let prefix = format!("{}needle\n", session(&dir));
+        let rest = text.strip_prefix(&prefix).expect(&text);
+        let (result, prompt) = rest.split_once("> \n").expect(rest);
+        assert_eq!(prompt, "");
+        assert_eq!(result.lines().count(), 1, "{result}");
+        assert!(result.contains("notes.txt"), "{result}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reply_prints_the_system_two_text() {
+        let dir = temp_dir("reply");
+        let model = ScriptedDecision::new(&[("reply", 0.9)]);
+        let writer = ScriptedWriter::new(vec![GenOutput::Text("fixed".into())]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("hello\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text, format!("{}hello\nfixed\n> \n", session(&dir)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn edit_writes_inside_the_directory_and_prints_the_path() {
+        let dir = temp_dir("edit");
+        let model = ScriptedDecision::new(&[("edit", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![GenOutput::Json(
+            json!({"path": "out.txt", "patch": "hello\n"}),
+        )]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("go\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text, format!("{}go\nout.txt\n> \n", session(&dir)));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("out.txt")).unwrap(),
+            "hello\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = temp_dir("edit-outside");
+        let outside_name = format!("seaotter-outside-{}.txt", std::process::id());
+        let outside = dir.parent().unwrap().join(&outside_name);
+        let _ = std::fs::remove_file(&outside);
+        let model = ScriptedDecision::new(&[("edit", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![GenOutput::Json(
+            json!({"path": format!("../{outside_name}"), "patch": "no\n"}),
+        )]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("go\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        assert!(!outside.exists());
+        assert!(!dir.join(&outside_name).exists());
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text, format!("{}go\n> \n", session(&dir)));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[test]
+    fn shell_then_stop_adds_no_result_line() {
+        let dir = temp_dir("shell");
+        let model = ScriptedDecision::new(&[("shell", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("hello\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text, format!("{}hello\n> \n", session(&dir)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
