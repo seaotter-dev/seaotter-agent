@@ -50,6 +50,15 @@ fn main() -> ExitCode {
             print!("{}", json_events(message));
             return ExitCode::SUCCESS;
         }
+        Ok(Request::Rpc) => {
+            let mut input = String::new();
+            if let Err(err) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut input) {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+            print!("{}", serve_rpc(&input));
+            return ExitCode::SUCCESS;
+        }
         Ok(Request::Workflow(workflow, bin, rest)) => (workflow, bin, rest),
         Err(err) => {
             eprintln!("{err}");
@@ -79,6 +88,7 @@ enum Request<'a> {
     Continue,
     Print(&'a str),
     Json(&'a str),
+    Rpc,
     Workflow(&'a str, &'static str, &'a [String]),
 }
 
@@ -112,16 +122,24 @@ fn parse_output(args: &[String]) -> Result<Option<Request<'_>>, String> {
         }
         Some("--mode") => {
             let mode = args.get(1).ok_or("--mode needs json")?;
-            if mode != "json" {
-                return Err(format!("unknown mode `{mode}`"));
+            match mode.as_str() {
+                "json" => {
+                    if args.len() == 2 {
+                        return Err("--mode json needs a message".into());
+                    }
+                    if args.len() != 3 {
+                        return Err("--mode json takes one message".into());
+                    }
+                    Ok(Some(Request::Json(&args[2])))
+                }
+                "rpc" => {
+                    if args.len() != 2 {
+                        return Err("--mode rpc takes no message".into());
+                    }
+                    Ok(Some(Request::Rpc))
+                }
+                other => Err(format!("unknown mode `{other}`")),
             }
-            if args.len() == 2 {
-                return Err("--mode json needs a message".into());
-            }
-            if args.len() != 3 {
-                return Err("--mode json takes one message".into());
-            }
-            Ok(Some(Request::Json(&args[2])))
         }
         _ => Ok(None),
     }
@@ -141,6 +159,74 @@ fn json_events(message: &str) -> String {
         serde_json::to_string(&effect).expect("effect"),
         serde_json::to_string(&reply).expect("reply"),
     )
+}
+
+enum RpcStep {
+    Continue(String),
+    Stop(String),
+}
+
+fn serve_rpc(input: &str) -> String {
+    let mut out = String::new();
+    let mut remembered: Option<String> = None;
+    for line in input.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        match command_output(line, &mut remembered) {
+            RpcStep::Continue(text) => out.push_str(&text),
+            RpcStep::Stop(text) => {
+                out.push_str(&text);
+                break;
+            }
+        }
+    }
+    out
+}
+
+fn command_output(line: &str, remembered: &mut Option<String>) -> RpcStep {
+    let value: serde_json::Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => return RpcStep::Stop(response_error(None, &err.to_string())),
+    };
+    let command = value.get("command").and_then(|command| command.as_str());
+    match command {
+        Some("prompt") => match value.get("message").and_then(|message| message.as_str()) {
+            Some(message) => {
+                remembered.replace(message.to_string());
+                RpcStep::Continue(events_and_response(message, "prompt"))
+            }
+            None => RpcStep::Continue(response_error(Some("prompt"), "message")),
+        },
+        Some("continue") => match remembered.clone() {
+            Some(message) => RpcStep::Continue(events_and_response(&message, "continue")),
+            None => RpcStep::Continue(response_error(Some("continue"), "no prompt")),
+        },
+        Some("abort") => RpcStep::Stop(response_line("abort")),
+        Some(other) => RpcStep::Stop(response_error(None, &format!("unknown command `{other}`"))),
+        None => RpcStep::Stop(response_error(None, "missing command")),
+    }
+}
+
+fn events_and_response(message: &str, command: &str) -> String {
+    let mut text = json_events(message);
+    text.push_str(&response_line(command));
+    text
+}
+
+fn response_line(command: &str) -> String {
+    let value = serde_json::json!({"kind": "response", "command": command});
+    format!("{}\n", serde_json::to_string(&value).expect("response"))
+}
+
+fn response_error(command: Option<&str>, error: &str) -> String {
+    let value = match command {
+        Some(command) => {
+            serde_json::json!({"kind": "response", "command": command, "error": error})
+        }
+        None => serde_json::json!({"kind": "response", "error": error}),
+    };
+    format!("{}\n", serde_json::to_string(&value).expect("response"))
 }
 
 fn system_prompt(dir: &Path) -> String {
@@ -366,7 +452,7 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 mod tests {
     use super::{
         Entry, Request, active_branch, continue_session, ensure_workspace, json_events, parse,
-        print_reply, session, start_session, system_prompt,
+        print_reply, serve_rpc, session, start_session, system_prompt,
     };
 
     fn args(values: &[&str]) -> Vec<String> {
@@ -688,8 +774,86 @@ mod tests {
         assert_eq!(reply["text"], "hello");
         let err = parse(&args(&["--mode"])).unwrap_err();
         assert!(err.contains("json"), "{err}");
-        let err = parse(&args(&["--mode", "rpc"])).unwrap_err();
-        assert!(err.contains("rpc"), "{err}");
+        assert!(matches!(
+            parse(&args(&["--mode", "rpc"])).unwrap(),
+            Request::Rpc
+        ));
+        let err = parse(&args(&["--mode", "rpc", "extra"])).unwrap_err();
+        assert!(err.contains("message"), "{err}");
+        let err = parse(&args(&["--mode", "other"])).unwrap_err();
+        assert!(err.contains("other"), "{err}");
+    }
+
+    fn rpc_lines(input: &str) -> Vec<serde_json::Value> {
+        serve_rpc(input)
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn rpc_prompt_writes_events_and_a_response() {
+        let lines = rpc_lines(r#"{"command":"prompt","message":"hello"}"#);
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        assert_eq!(lines[0]["kind"], "decision");
+        assert_eq!(lines[0]["action"], "read");
+        assert_eq!(lines[1]["kind"], "effect");
+        assert_eq!(lines[1]["name"], "read");
+        assert_eq!(lines[2]["kind"], "reply");
+        assert_eq!(lines[2]["text"], "hello");
+        assert_eq!(lines[3]["kind"], "response");
+        assert_eq!(lines[3]["command"], "prompt");
+        let missing = rpc_lines(r#"{"command":"prompt"}"#);
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert_eq!(missing[0]["error"], "message");
+        assert!(missing[0].get("text").is_none());
+    }
+
+    #[test]
+    fn rpc_continue_repeats_the_prompt_or_reports_none() {
+        let lines = rpc_lines(
+            "{\"command\":\"prompt\",\"message\":\"hello\"}\n{\"command\":\"continue\"}\n",
+        );
+        assert_eq!(lines.len(), 8, "{lines:?}");
+        assert_eq!(lines[6]["kind"], "reply");
+        assert_eq!(lines[6]["text"], "hello");
+        assert_eq!(lines[7]["kind"], "response");
+        assert_eq!(lines[7]["command"], "continue");
+        let missing = rpc_lines(
+            "{\"command\":\"continue\"}\n{\"command\":\"prompt\",\"message\":\"later\"}\n",
+        );
+        assert_eq!(missing[0]["error"], "no prompt");
+        assert!(
+            missing
+                .iter()
+                .take(1)
+                .all(|line| line["kind"] != "decision")
+        );
+        assert_eq!(missing[1]["kind"], "decision");
+        assert_eq!(missing.last().unwrap()["command"], "prompt");
+    }
+
+    #[test]
+    fn rpc_abort_stops_before_the_next_command() {
+        let lines =
+            rpc_lines("{\"command\":\"abort\"}\n{\"command\":\"prompt\",\"message\":\"later\"}\n");
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert_eq!(lines[0]["kind"], "response");
+        assert_eq!(lines[0]["command"], "abort");
+        assert!(
+            !serve_rpc("{\"command\":\"abort\"}\n{\"command\":\"prompt\",\"message\":\"later\"}\n")
+                .contains("later")
+        );
+    }
+
+    #[test]
+    fn rpc_does_not_write_a_session() {
+        let dir = std::env::temp_dir().join(format!("seaotter-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = serve_rpc(r#"{"command":"prompt","message":"hello"}"#);
+        assert!(!dir.join(".seaotter").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
