@@ -5,6 +5,17 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let (_workflow, bin, rest) = match parse(&args) {
         Ok(Request::Health) => return ExitCode::SUCCESS,
+        Ok(Request::Session) => {
+            let dir = match std::env::current_dir() {
+                Ok(dir) => dir,
+                Err(err) => {
+                    eprintln!("{err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            print!("{}", session(&dir));
+            return ExitCode::SUCCESS;
+        }
         Ok(Request::Workflow(workflow, bin, rest)) => (workflow, bin, rest),
         Err(err) => {
             eprintln!("{err}");
@@ -30,15 +41,23 @@ fn main() -> ExitCode {
 #[derive(Debug)]
 enum Request<'a> {
     Health,
+    Session,
     Workflow(&'a str, &'static str, &'a [String]),
 }
 
 fn parse(args: &[String]) -> Result<Request<'_>, String> {
+    if args.is_empty() {
+        return Ok(Request::Session);
+    }
     if args.len() == 1 && args[0] == "--health" {
         return Ok(Request::Health);
     }
     let (workflow, bin, rest) = parse_workflow(args)?;
     Ok(Request::Workflow(workflow, bin, rest))
+}
+
+fn session(dir: &Path) -> String {
+    format!("{}\n> \n", dir.display())
 }
 
 fn ensure_workspace(root: &Path) -> Result<(), String> {
@@ -63,7 +82,7 @@ fn parse_workflow(args: &[String]) -> Result<(&str, &'static str, &[String]), St
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, ensure_workspace, parse};
+    use super::{Request, ensure_workspace, parse, session};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().copied().map(str::to_string).collect()
@@ -99,9 +118,21 @@ mod tests {
     }
 
     #[test]
-    fn missing_flag() {
-        let err = parse(&[]).unwrap_err();
-        assert!(err.contains("--workflow"), "{err}");
+    fn no_arguments_open_a_session() {
+        assert!(matches!(parse(&[]).unwrap(), Request::Session));
+    }
+
+    #[test]
+    fn an_empty_session_prints_the_directory_and_a_prompt() {
+        let dir = std::env::temp_dir().join(format!("seaotter-session-{}", std::process::id()));
+        let text = session(&dir);
+        assert_eq!(text, format!("{}\n> \n", dir.display()));
+    }
+
+    #[test]
+    fn workflow_without_a_name_still_fails() {
+        let err = parse(&args(&["--workflow"])).unwrap_err();
+        assert!(err.contains("name"), "{err}");
     }
 
     #[test]
