@@ -295,3 +295,61 @@ Tracked in Linear under the [Terminal agent](https://linear.app/seaotter-dev/pro
    * SEA-432 TypeScript SDK
    * SEA-433 Python SDK
    * SEA-434 Run the agent in Docker
+
+## Goal (interactive agent)
+
+No arguments print the session and wait at `> `. Rust owns the turn. System One chooses one action: read, search, edit, shell, reply, or stop. System Two writes only for reply, edit, and, when the action is shell, one `{argv}` schema. A request carries no tool list.
+
+The screen is a transcript of the person, the tool, and the reply, with the prompt at the bottom. `--print` stays one-shot. Starting again in that directory shows the active branch and waits.
+
+Each finished step is a line in `.seaotter/sessions/` before the next step starts. Read and search may run again after a crash. A shell that was cut off is marked interrupted and is not spawned again. Compaction leaves the older lines in the file. A line typed while a turn is running waits, then runs after that turn.
+
+The MCP server and the Mermaid wireframe stay. `--workflow` still runs `examples/ticket-router`, `examples/gated-generate`, and `examples/effects`.
+
+The issues listed under [interactive agent slices](#interactive-agent-slices) are this phase's work breakdown. Stay inside the non-goals.
+
+## Non-goals (interactive agent)
+
+* An extension registry
+* Hooks
+* A custom task runtime
+* Subagents
+* Multiplayer watch
+* Hot reload
+* A second storage backend
+* A skill marketplace
+* A theme engine
+
+## Interactive agent acceptance
+
+* No arguments print the session and wait at `> `.
+* System One chooses the action.
+* System Two writes only for reply, edit, and a shell `{argv}` schema.
+* A request carries no tool list.
+* The screen is a transcript of the person, the tool, and the reply, with the prompt at the bottom.
+* `--print` stays one-shot.
+* Starting again in that directory shows the active branch and waits.
+* Each finished step is a line in `.seaotter/sessions/` before the next step starts.
+* Read and search may run again after a crash. A shell that was cut off is marked interrupted and is not spawned again.
+* Compaction leaves the older lines in the file.
+* A line typed while a turn is running waits, then runs after that turn.
+* Non-goals name an extension registry and a skill marketplace.
+* The MCP server and the Mermaid wireframe stay.
+* `--workflow` still runs the three examples.
+
+## Interactive agent slices
+
+Tracked in Linear under the [Interactive coding agent](https://linear.app/seaotter-dev/project/interactive-coding-agent-79da90d1d576) project.
+
+1. Spec
+   * SEA-436 Land the interactive-agent spec
+2. CLI
+   * SEA-437 Keep the prompt open
+   * SEA-438 Run one turn from the line
+   * SEA-439 Confirm a shell and skip it after a crash
+3. TUI
+   * SEA-440 Draw the transcript above the prompt
+   * SEA-441 Abort with Esc and queue the next line
+4. Resume
+   * SEA-442 Reopen the newest session
+   * SEA-443 Compact while the prompt stays up
