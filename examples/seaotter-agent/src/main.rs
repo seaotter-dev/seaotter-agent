@@ -608,6 +608,12 @@ fn read_prompt_with<W: Write>(
         if line == "/quit" {
             return Ok(());
         }
+        if line == "/compact" {
+            if !compact_prompt(dir, frame)? {
+                frame.emit_prompt("> ", "> \n")?;
+            }
+            continue;
+        }
         append_line(dir, &line)?;
         frame.emit_line(Role::Person, &line)?;
         if let Err(err) = run_turn(
@@ -623,7 +629,7 @@ fn read_prompt_with<W: Write>(
         ) {
             eprintln!("{err}");
         }
-        if queued.is_empty() {
+        if queued.is_empty() && !compact_prompt(dir, frame)? {
             let prompt = if editing.is_empty() {
                 "> ".to_string()
             } else {
@@ -1116,6 +1122,28 @@ fn open_session(dir: &Path) -> Result<String, String> {
         text.push_str("> \n");
     }
     Ok(text)
+}
+
+fn compact_prompt<W: Write>(dir: &Path, frame: &mut Frame<'_, W>) -> Result<bool, String> {
+    let path = newest_session(dir)?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|err| format!("reading {}: {err}", path.display()))?;
+    let mut entries = parse_entries(&path, &raw)?;
+    let added = compact(&entries)?;
+    if added.is_empty() {
+        return Ok(false);
+    }
+    append_entries(&path, &raw, &added)?;
+    entries.extend(added);
+    let mut text: String = active_branch(&entries)?
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect();
+    if !text.ends_with("> \n") {
+        text.push_str("> \n");
+    }
+    frame.emit_session(&text)?;
+    Ok(true)
 }
 
 fn continue_session(dir: &Path) -> Result<String, String> {
@@ -2558,6 +2586,134 @@ mod tests {
             .filter(|line| !line.is_empty())
             .count();
         assert_eq!(added, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn long_branch_body() -> String {
+        let older_a = "a".repeat(200);
+        let older_b = format!("{}PAST-CUT", "b".repeat(100));
+        let recent_a = format!("{}RECENT-A", "r".repeat(400));
+        let recent_b = format!("{}RECENT-B", "s".repeat(400));
+        format!(
+            "{}{}{}{}{}",
+            entry_line("1", None, &older_a),
+            entry_line("2", Some("1"), &older_b),
+            entry_line("3", Some("1"), "SIBLING\n"),
+            entry_line("4", Some("2"), &recent_a),
+            entry_line("5", Some("4"), &recent_b),
+        )
+    }
+
+    fn file_entries(path: &std::path::Path) -> Vec<Entry> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn compact_appends_a_summary_and_keeps_the_prompt() {
+        let dir = temp_dir("compact-command");
+        let body = long_branch_body();
+        let path = write_session(&dir, "session.jsonl", &body);
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("/compact\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.ends_with("> \n"), "{text}");
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(stored.starts_with(&body), "{stored}");
+        let entries = file_entries(&path);
+        assert!(entries.iter().all(|entry| entry.text != "/compact\n"));
+        let added = stored[body.len()..]
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
+        assert_eq!(added, 3);
+        let branch = active_branch(&entries).unwrap();
+        assert!(branch.iter().all(|entry| !entry.text.contains("PAST-CUT")));
+        assert!(branch.iter().any(|entry| entry.text.contains("RECENT-A")));
+        let effect = harness_effects::Search::new(&dir).unwrap();
+        let value = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(harness_core::Effect::run(
+                &effect,
+                json!({"query": "PAST-CUT"}),
+            ))
+            .unwrap();
+        let paths = value
+            .get("paths")
+            .and_then(|value| value.as_array())
+            .unwrap();
+        assert!(
+            paths
+                .iter()
+                .any(|path| path.as_str().unwrap().contains(".seaotter/sessions")),
+            "{paths:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_long_line_compacts_before_the_prompt_returns() {
+        let dir = temp_dir("compact-size");
+        let body = long_branch_body();
+        let path = write_session(&dir, "session.jsonl", &body);
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("go\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(stored.starts_with(&body), "{stored}");
+        let added = file_entries(&path);
+        let extra = &added[5..];
+        assert_eq!(extra[0].text, "go\n");
+        assert_eq!(extra.len(), 4, "{extra:?}");
+        assert!(extra.iter().all(|entry| entry.text != "/quit\n"));
+        let branch = active_branch(&added).unwrap();
+        assert!(branch.iter().any(|entry| entry.text == "go\n"));
+        assert!(branch.iter().all(|entry| !entry.text.contains("PAST-CUT")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_short_compact_adds_nothing() {
+        let dir = temp_dir("compact-short");
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("/compact\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let entries = prompt_entries(&dir);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].text, session(&dir));
+        assert!(entries.iter().all(|entry| entry.text != "/compact\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
