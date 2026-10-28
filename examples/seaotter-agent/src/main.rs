@@ -583,7 +583,7 @@ fn read_prompt_with<W: Write>(
     keys: &mut dyn Keys,
 ) -> Result<(), String> {
     mark_interrupted(dir, frame)?;
-    let text = start_session(dir)?;
+    let text = open_session(dir)?;
     frame.emit_session(&text)?;
     let mut queued = VecDeque::new();
     let mut editing = String::new();
@@ -1097,6 +1097,25 @@ fn append_line(dir: &Path, line: &str) -> Result<(), String> {
         text: format!("{line}\n"),
     };
     append_entries(&path, &raw, &[entry])
+}
+
+fn open_session(dir: &Path) -> Result<String, String> {
+    let path = match newest_session(dir) {
+        Ok(path) => path,
+        Err(err) if err == "no session" => return start_session(dir),
+        Err(err) => return Err(err),
+    };
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|err| format!("reading {}: {err}", path.display()))?;
+    let entries = parse_entries(&path, &raw)?;
+    let mut text: String = active_branch(&entries)?
+        .into_iter()
+        .map(|entry| entry.text)
+        .collect();
+    if !text.ends_with("> \n") {
+        text.push_str("> \n");
+    }
+    Ok(text)
 }
 
 fn continue_session(dir: &Path) -> Result<String, String> {
@@ -2362,6 +2381,183 @@ mod tests {
             .unwrap();
         assert_eq!(entries[shell + 1].text, "abort\n");
         assert!(entries.iter().all(|entry| entry.text != "skipped\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn starting_again_shows_the_active_branch_and_waits() {
+        let dir = temp_dir("reopen");
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("hello\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains(&dir.display().to_string()), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.ends_with("> \n"), "{text}");
+        let entries = prompt_entries(&dir);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].text, session(&dir));
+        assert_eq!(entries[1].text, "hello\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_after_reopen_stays_in_the_same_file() {
+        let dir = temp_dir("reopen-next");
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("hello\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("next\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let entries = prompt_entries(&dir);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[1].text, "hello\n");
+        assert_eq!(entries[2].text, "next\n");
+        assert_eq!(entries[2].parent.as_deref(), Some(entries[1].id.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopening_shows_the_tip_and_leaves_the_file() {
+        let dir = temp_dir("reopen-fork");
+        let sessions = dir.join(".seaotter/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let older = sessions.join("older.jsonl");
+        let newer = sessions.join("newer.jsonl");
+        std::fs::write(
+            &older,
+            "{\"id\":\"1\",\"parent\":null,\"text\":\"old session\\n\"}\n",
+        )
+        .unwrap();
+        let body = concat!(
+            "{\"id\":\"1\",\"parent\":null,\"text\":\"root\\n\"}\n",
+            "{\"id\":\"2\",\"parent\":\"1\",\"text\":\"sibling\\n\"}\n",
+            "{\"id\":\"3\",\"parent\":\"1\",\"text\":\"tip\\n\"}\n",
+        );
+        std::fs::write(&newer, body).unwrap();
+        let epoch = std::time::SystemTime::UNIX_EPOCH;
+        std::fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(epoch + std::time::Duration::from_secs(1))
+            .unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&newer)
+            .unwrap()
+            .set_modified(epoch + std::time::Duration::from_secs(2))
+            .unwrap();
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("root\n"), "{text}");
+        assert!(text.contains("tip\n"), "{text}");
+        assert!(!text.contains("sibling"), "{text}");
+        assert!(!text.contains("old session"), "{text}");
+        assert!(text.ends_with("> \n"), "{text}");
+        assert_eq!(std::fs::read_to_string(&newer).unwrap(), body);
+        assert_eq!(
+            std::fs::read_dir(&sessions).unwrap().count(),
+            2,
+            "reopen created another session file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reopening_does_not_compact_and_continue_still_does() {
+        let dir = temp_dir("reopen-long");
+        let older_a = "a".repeat(200);
+        let older_b = format!("{}PAST-CUT", "b".repeat(100));
+        let recent_a = format!("{}RECENT-A", "r".repeat(400));
+        let recent_b = format!("{}RECENT-B", "s".repeat(400));
+        let body = format!(
+            "{}{}{}{}{}",
+            entry_line("1", None, &older_a),
+            entry_line("2", Some("1"), &older_b),
+            entry_line("3", Some("1"), "SIBLING\n"),
+            entry_line("4", Some("2"), &recent_a),
+            entry_line("5", Some("4"), &recent_b),
+        );
+        let path = write_session(&dir, "session.jsonl", &body);
+        let (model, writer) = stop_model();
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut NoKeys,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("PAST-CUT"), "{text}");
+        assert!(text.contains("RECENT-A"), "{text}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), body);
+        let continued = continue_session(&dir).unwrap();
+        assert!(continued.contains("RECENT-A"), "{continued}");
+        assert!(continued.contains("RECENT-B"), "{continued}");
+        assert!(!continued.contains("PAST-CUT"), "{continued}");
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(stored.starts_with(&body), "{stored}");
+        let added = stored[body.len()..]
+            .lines()
+            .filter(|line| !line.is_empty())
+            .count();
+        assert_eq!(added, 3);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
