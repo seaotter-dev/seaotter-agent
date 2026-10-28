@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -29,7 +30,22 @@ fn main() -> ExitCode {
             let mut stdout = std::io::stdout().lock();
             let turn = OfflineTurn::new(dir.clone());
             let terminal = stdout.is_terminal();
-            if let Err(err) = read_prompt(&dir, stdin.lock(), &mut stdout, &turn, &turn, terminal) {
+            let mut terminal_keys = TerminalKeys;
+            let mut no_keys = NoKeys;
+            let keys: &mut dyn Keys = if terminal {
+                &mut terminal_keys
+            } else {
+                &mut no_keys
+            };
+            if let Err(err) = read_prompt(
+                &dir,
+                stdin.lock(),
+                &mut stdout,
+                &turn,
+                &turn,
+                terminal,
+                keys,
+            ) {
                 eprintln!("{err}");
                 return ExitCode::FAILURE;
             }
@@ -357,6 +373,7 @@ struct Frame<'a, W: Write> {
     lines: Vec<TranscriptLine>,
     prompt: String,
     alternate: bool,
+    raw: bool,
 }
 
 impl<'a, W: Write> Frame<'a, W> {
@@ -368,6 +385,7 @@ impl<'a, W: Write> Frame<'a, W> {
             lines: Vec::new(),
             prompt: "> ".into(),
             alternate: false,
+            raw: false,
         }
     }
 
@@ -414,6 +432,8 @@ impl<'a, W: Write> Frame<'a, W> {
             crossterm::execute!(self.output, crossterm::terminal::EnterAlternateScreen)
                 .map_err(|err| err.to_string())?;
             self.alternate = true;
+            crossterm::terminal::enable_raw_mode().map_err(|err| err.to_string())?;
+            self.raw = true;
         }
         crossterm::execute!(
             self.output,
@@ -437,12 +457,106 @@ impl<'a, W: Write> Frame<'a, W> {
     }
 
     fn leave(&mut self) {
+        if self.raw {
+            let _ = crossterm::terminal::disable_raw_mode();
+            self.raw = false;
+        }
         if !self.alternate {
             return;
         }
         let _ = crossterm::execute!(self.output, crossterm::terminal::LeaveAlternateScreen);
         self.alternate = false;
     }
+}
+
+enum Stroke {
+    Char(char),
+    Enter,
+    Backspace,
+    Esc,
+}
+
+trait Keys {
+    fn poll(&mut self) -> Result<Vec<Stroke>, String>;
+}
+
+struct NoKeys;
+
+impl Keys for NoKeys {
+    fn poll(&mut self) -> Result<Vec<Stroke>, String> {
+        Ok(Vec::new())
+    }
+}
+
+struct TerminalKeys;
+
+impl Keys for TerminalKeys {
+    fn poll(&mut self) -> Result<Vec<Stroke>, String> {
+        let mut strokes = Vec::new();
+        while crossterm::event::poll(std::time::Duration::ZERO).map_err(|err| err.to_string())? {
+            let event = crossterm::event::read().map_err(|err| err.to_string())?;
+            if let Some(Key::Stroke(stroke)) = key_stroke(event) {
+                strokes.push(stroke);
+            }
+        }
+        Ok(strokes)
+    }
+}
+
+enum Key {
+    Stroke(Stroke),
+    End,
+}
+
+fn key_stroke(event: crossterm::event::Event) -> Option<Key> {
+    let crossterm::event::Event::Key(key) = event else {
+        return None;
+    };
+    if key.kind != crossterm::event::KeyEventKind::Press {
+        return None;
+    }
+    if key
+        .modifiers
+        .contains(crossterm::event::KeyModifiers::CONTROL)
+    {
+        if matches!(key.code, crossterm::event::KeyCode::Char('c' | 'd')) {
+            return Some(Key::End);
+        }
+        return None;
+    }
+    match key.code {
+        crossterm::event::KeyCode::Esc => Some(Key::Stroke(Stroke::Esc)),
+        crossterm::event::KeyCode::Enter => Some(Key::Stroke(Stroke::Enter)),
+        crossterm::event::KeyCode::Backspace => Some(Key::Stroke(Stroke::Backspace)),
+        crossterm::event::KeyCode::Char(ch) => Some(Key::Stroke(Stroke::Char(ch))),
+        _ => None,
+    }
+}
+
+fn wait_key() -> Result<Option<Stroke>, String> {
+    loop {
+        let event = crossterm::event::read().map_err(|err| err.to_string())?;
+        match key_stroke(event) {
+            Some(Key::End) => return Ok(None),
+            Some(Key::Stroke(stroke)) => return Ok(Some(stroke)),
+            None => {}
+        }
+    }
+}
+
+fn take_strokes(strokes: &[Stroke], queued: &mut VecDeque<String>, editing: &mut String) -> bool {
+    let mut aborted = false;
+    for stroke in strokes {
+        match stroke {
+            Stroke::Esc => aborted = true,
+            Stroke::Char(ch) => editing.push(*ch),
+            Stroke::Backspace => {
+                editing.pop();
+            }
+            Stroke::Enter => queued.push_back(std::mem::take(editing)),
+        }
+    }
+    aborted
 }
 
 fn read_prompt(
@@ -452,9 +566,10 @@ fn read_prompt(
     model: &dyn DecisionModel,
     writer: &dyn GenerativeModel,
     terminal: bool,
+    keys: &mut dyn Keys,
 ) -> Result<(), String> {
     let mut frame = Frame::new(output, terminal);
-    let result = read_prompt_with(dir, &mut input, model, writer, &mut frame);
+    let result = read_prompt_with(dir, &mut input, model, writer, &mut frame, keys);
     frame.leave();
     result
 }
@@ -465,13 +580,26 @@ fn read_prompt_with<W: Write>(
     model: &dyn DecisionModel,
     writer: &dyn GenerativeModel,
     frame: &mut Frame<'_, W>,
+    keys: &mut dyn Keys,
 ) -> Result<(), String> {
     mark_interrupted(dir, frame)?;
     let text = start_session(dir)?;
     frame.emit_session(&text)?;
+    let mut queued = VecDeque::new();
+    let mut editing = String::new();
     loop {
-        let Some(line) = read_one(input)? else {
-            return Ok(());
+        let line = if let Some(line) = queued.pop_front() {
+            line
+        } else if frame.terminal {
+            let Some(line) = read_edited_line(frame, &mut editing)? else {
+                return Ok(());
+            };
+            line
+        } else {
+            let Some(line) = read_one(input)? else {
+                return Ok(());
+            };
+            line
         };
         if line.is_empty() {
             frame.emit_prompt("> ", "> \n")?;
@@ -482,10 +610,45 @@ fn read_prompt_with<W: Write>(
         }
         append_line(dir, &line)?;
         frame.emit_line(Role::Person, &line)?;
-        if let Err(err) = run_turn(dir, &line, input, model, writer, frame) {
+        if let Err(err) = run_turn(
+            dir,
+            &line,
+            input,
+            model,
+            writer,
+            frame,
+            keys,
+            &mut queued,
+            &mut editing,
+        ) {
             eprintln!("{err}");
         }
-        frame.emit_prompt("> ", "> \n")?;
+        if queued.is_empty() {
+            let prompt = if editing.is_empty() {
+                "> ".to_string()
+            } else {
+                format!("> {editing}")
+            };
+            frame.emit_prompt(&prompt, "> \n")?;
+        }
+    }
+}
+
+fn read_edited_line<W: Write>(
+    frame: &mut Frame<'_, W>,
+    editing: &mut String,
+) -> Result<Option<String>, String> {
+    loop {
+        frame.emit_prompt(&format!("> {editing}"), "> \n")?;
+        match wait_key()? {
+            None => return Ok(None),
+            Some(Stroke::Esc) => {}
+            Some(Stroke::Char(ch)) => editing.push(ch),
+            Some(Stroke::Backspace) => {
+                editing.pop();
+            }
+            Some(Stroke::Enter) => return Ok(Some(std::mem::take(editing))),
+        }
     }
 }
 
@@ -624,6 +787,9 @@ fn run_turn<W: Write>(
     model: &dyn DecisionModel,
     writer: &dyn GenerativeModel,
     frame: &mut Frame<'_, W>,
+    keys: &mut dyn Keys,
+    queued: &mut VecDeque<String>,
+    editing: &mut String,
 ) -> Result<(), String> {
     let system = system_prompt(dir);
     let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
@@ -635,7 +801,19 @@ fn run_turn<W: Write>(
     let steps = runtime
         .block_on(choose(&watched, writer, line, &system))
         .map_err(|err| err.to_string())?;
-    for step in steps {
+    let mut aborted = false;
+    let mut steps = steps.into_iter();
+    loop {
+        let strokes = keys.poll()?;
+        if take_strokes(&strokes, queued, editing) {
+            aborted = true;
+        }
+        if aborted {
+            break;
+        }
+        let Some(step) = steps.next() else {
+            break;
+        };
         match step.action {
             Action::Read => {
                 let effect = FileRead::new(dir).map_err(|err| err.to_string())?;
@@ -693,14 +871,35 @@ fn run_turn<W: Write>(
             }
             Action::Stop => {}
             Action::Shell => {
-                confirm_shell(dir, line, &system, &runtime, input, writer, frame)?;
+                if confirm_shell(
+                    dir, line, &system, &runtime, input, writer, frame, keys, queued, editing,
+                )? == ShellEnd::Abort
+                {
+                    aborted = true;
+                    break;
+                }
             }
         }
     }
-    if *low_shell.lock().expect("low shell") {
+    if aborted {
+        append_line(dir, "abort")?;
+        frame.emit_line(Role::Tool, "abort")?;
+    } else if *low_shell.lock().expect("low shell") {
         frame.emit_line(Role::Tool, "skip")?;
     }
     Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+enum ShellEnd {
+    Done,
+    Abort,
+}
+
+enum ShellAnswer {
+    Line(String),
+    Abort,
+    End,
 }
 
 fn confirm_shell<W: Write>(
@@ -711,7 +910,10 @@ fn confirm_shell<W: Write>(
     input: &mut impl std::io::BufRead,
     writer: &dyn GenerativeModel,
     frame: &mut Frame<'_, W>,
-) -> Result<(), String> {
+    keys: &mut dyn Keys,
+    queued: &mut VecDeque<String>,
+    editing: &mut String,
+) -> Result<ShellEnd, String> {
     let spec = OutputSpec::Schema(JsonSchema(json!({
         "type": "object",
         "additionalProperties": false,
@@ -763,12 +965,24 @@ fn confirm_shell<W: Write>(
     let shown = args.join(" ");
     frame.emit_line(Role::Tool, &shown)?;
     append_line(dir, &format!("shell {shown}"))?;
-    frame.emit_prompt("yes? ", "yes? ")?;
-    let answer = read_one(input)?;
+    let strokes = keys.poll()?;
+    if take_strokes(&strokes, queued, editing) {
+        return Ok(ShellEnd::Abort);
+    }
+    let answer = if frame.terminal {
+        match read_shell_answer(frame)? {
+            ShellAnswer::Abort => return Ok(ShellEnd::Abort),
+            ShellAnswer::End => None,
+            ShellAnswer::Line(text) => Some(text),
+        }
+    } else {
+        frame.emit_prompt("yes? ", "yes? ")?;
+        read_one(input)?
+    };
     if answer.as_deref() != Some("yes") {
         frame.emit_line(Role::Tool, "skipped")?;
         append_line(dir, "skipped")?;
-        return Ok(());
+        return Ok(ShellEnd::Done);
     }
     let effect = Shell::new(program, &args[1..])
         .map_err(|err| err.to_string())?
@@ -786,7 +1000,24 @@ fn confirm_shell<W: Write>(
         stdout.trim_end_matches('\n').to_string()
     };
     frame.emit_line(Role::Tool, &stored)?;
-    append_line(dir, &stored)
+    append_line(dir, &stored)?;
+    Ok(ShellEnd::Done)
+}
+
+fn read_shell_answer<W: Write>(frame: &mut Frame<'_, W>) -> Result<ShellAnswer, String> {
+    let mut text = String::new();
+    loop {
+        frame.emit_prompt(&format!("yes? {text}"), "yes? ")?;
+        match wait_key()? {
+            None => return Ok(ShellAnswer::End),
+            Some(Stroke::Esc) => return Ok(ShellAnswer::Abort),
+            Some(Stroke::Enter) => return Ok(ShellAnswer::Line(text)),
+            Some(Stroke::Char(ch)) => text.push(ch),
+            Some(Stroke::Backspace) => {
+                text.pop();
+            }
+        }
+    }
 }
 
 fn is_contained(path: &Path) -> bool {
@@ -1056,9 +1287,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        Entry, Request, Role, TranscriptLine, active_branch, continue_session, ensure_workspace,
-        json_events, layout, parse, print_reply, read_prompt, serve_rpc, session, start_session,
-        system_prompt,
+        Entry, Keys, NoKeys, Request, Role, Stroke, TranscriptLine, active_branch,
+        continue_session, ensure_workspace, json_events, layout, parse, print_reply, read_prompt,
+        serve_rpc, session, start_session, system_prompt,
     };
 
     struct ScriptedDecision {
@@ -1128,6 +1359,29 @@ mod tests {
                     usage: Usage::default(),
                 })
             })
+        }
+    }
+
+    struct ScriptedKeys {
+        batches: Mutex<VecDeque<Vec<Stroke>>>,
+    }
+
+    impl ScriptedKeys {
+        fn new(batches: Vec<Vec<Stroke>>) -> Self {
+            Self {
+                batches: Mutex::new(batches.into()),
+            }
+        }
+    }
+
+    impl Keys for ScriptedKeys {
+        fn poll(&mut self) -> Result<Vec<Stroke>, String> {
+            Ok(self
+                .batches
+                .lock()
+                .expect("keys")
+                .pop_front()
+                .unwrap_or_default())
         }
     }
 
@@ -1274,6 +1528,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1300,6 +1555,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1327,6 +1583,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1364,6 +1621,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1389,6 +1647,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1411,6 +1670,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1437,6 +1697,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         assert!(!outside.exists());
@@ -1464,6 +1725,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1499,6 +1761,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1526,6 +1789,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1582,6 +1846,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -1604,6 +1869,7 @@ mod tests {
             &model,
             &writer,
             false,
+            &mut NoKeys,
         )
         .unwrap();
         let again = std::fs::read_to_string(&crashed).unwrap();
@@ -2000,5 +2266,102 @@ mod tests {
         assert!(root.join("workspace").is_dir());
         assert!(!root.join("log").exists());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn esc_stops_the_turn_and_records_abort() {
+        let dir = temp_dir("abort");
+        std::fs::write(dir.join("notes.txt"), "hello\n").unwrap();
+        let model = ScriptedDecision::new(&[("read", 0.9), ("edit", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![GenOutput::Json(
+            json!({"path": "out.txt", "patch": "no\n"}),
+        )]);
+        let mut keys = ScriptedKeys::new(vec![vec![], vec![Stroke::Esc]]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("notes.txt\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut keys,
+        )
+        .unwrap();
+        let text = String::from_utf8(output).unwrap();
+        assert!(text.contains("notes.txt 6\n"), "{text}");
+        assert!(text.contains("abort\n"), "{text}");
+        assert!(!dir.join("out.txt").exists());
+        let entries = prompt_entries(&dir);
+        let typed = &entries[entries.len() - 2];
+        let abort = entries.last().unwrap();
+        assert_eq!(typed.text, "notes.txt\n");
+        assert_eq!(abort.text, "abort\n");
+        assert_eq!(abort.parent.as_deref(), Some(typed.id.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_typed_during_the_turn_runs_after_it() {
+        let dir = temp_dir("queue");
+        let model = ScriptedDecision::new(&[("stop", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![]);
+        let later = ['l', 'a', 't', 'e', 'r']
+            .into_iter()
+            .map(Stroke::Char)
+            .chain(std::iter::once(Stroke::Enter))
+            .collect();
+        let mut keys = ScriptedKeys::new(vec![later]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("fix\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut keys,
+        )
+        .unwrap();
+        let entries = prompt_entries(&dir);
+        let fix = entries
+            .iter()
+            .position(|entry| entry.text == "fix\n")
+            .unwrap();
+        assert_eq!(entries[fix + 1].text, "later\n");
+        assert!(entries.iter().all(|entry| entry.text != "/quit\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esc_at_the_shell_question_records_abort() {
+        let dir = temp_dir("shell-esc");
+        let marker = dir.join("marker");
+        let model = ScriptedDecision::new(&[("shell", 0.9), ("stop", 0.9)]);
+        let writer = ScriptedWriter::new(vec![GenOutput::Json(
+            json!({"argv": ["/usr/bin/touch", marker.display().to_string()]}),
+        )]);
+        let mut keys = ScriptedKeys::new(vec![vec![], vec![Stroke::Esc]]);
+        let mut output = Vec::new();
+        read_prompt(
+            &dir,
+            std::io::Cursor::new("go\n/quit\n"),
+            &mut output,
+            &model,
+            &writer,
+            false,
+            &mut keys,
+        )
+        .unwrap();
+        assert!(!marker.exists());
+        let shown = format!("shell /usr/bin/touch {}\n", marker.display());
+        let entries = prompt_entries(&dir);
+        let shell = entries
+            .iter()
+            .position(|entry| entry.text == shown)
+            .unwrap();
+        assert_eq!(entries[shell + 1].text, "abort\n");
+        assert!(entries.iter().all(|entry| entry.text != "skipped\n"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
